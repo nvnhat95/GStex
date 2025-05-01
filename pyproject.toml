@@ -50,8 +50,6 @@ dependencies = [
     "scikit-image>=0.19.3",
     "splines==0.3.0",
     "tensorboard>=2.13.0",
-    "torch>=1.13.1",
-    "torchvision>=0.14.1",
     "torchmetrics[image]>=1.0.1",
     "typing_extensions>=4.4.0",
     "viser==0.2.0",
