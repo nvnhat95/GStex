@@ -989,6 +989,11 @@ class GStexModel(Model):
         
         return uv0, umap, vmap
 
+    def mlp_forward(self):
+        """ Placeholder for mlp forward pass
+        """
+        pass
+
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a Ray Bundle and returns a dictionary of outputs.
 
@@ -1129,6 +1134,22 @@ class GStexModel(Model):
             depth = torch.ones((H, W, 1), dtype=torch.float32, device=self.means.device)
             return {"rgb": rgb, "depth": depth}
 
+        # calculate delta_G
+        delta_G = self.mlp_forward()
+        means_delta = delta_G[:,0:3] # 3
+        quats_delta = delta_G[:,3:7] # 4
+        scales_delta = delta_G[:,7:10] # 3
+        opacities_delta = delta_G[:,10:11] # 1
+        gaussian_rgbs_delta = delta_G[:,11:] # 12
+
+        # create G' = lambda * G + (1 - lambda) * delta_G
+        lambda_ = 0.9
+        means = lambda_ * means + (1 - lambda_) * means_delta
+        quats = lambda_ * quats + (1 - lambda_) * quats_delta
+        scales = lambda_ * scales + (1 - lambda_) * scales_delta
+        opacities = lambda_ * opacities + (1 - lambda_) * opacities_delta
+        gaussian_rgbs = lambda_ * gaussian_rgbs + (1 - lambda_) * gaussian_rgbs_delta
+            
         def custom_texture_gaussians(custom_rgbs, custom_texture, custom_opacities, custom_settings):
             custom_outputs = texture_gaussians(
                 texture_info,
