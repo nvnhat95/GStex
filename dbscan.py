@@ -5,6 +5,43 @@ from plyfile import PlyData
 from dataclasses import dataclass
 
 
+@dataclass
+class GaussianPrimitives:
+    xyz: torch.Tensor        # (N, 3)
+    scaling: torch.Tensor    # (N, 3)
+    rotation: torch.Tensor   # (N, 4)
+    opacity: torch.Tensor    # (N, 1)
+    features_dc: torch.Tensor# (N, 3, 1)
+    features_rest: torch.Tensor# (N, 3, SH_coeffs - 1)
+    
+    @classmethod
+    def from_tensor(cls, xyz, scaling, rotation, opacity, 
+                    features_dc=None, features_rest=None):
+        """
+        Decompose a tensor of shape (N, D) into GaussianPrimitives.
+        """
+        return cls(
+            xyz=xyz,
+            scaling=scaling,
+            rotation=rotation,
+            opacity=opacity,
+            features_dc=features_dc,
+            features_rest=features_rest,
+        )
+    
+    def to_tensor(self) -> torch.Tensor:
+        """Convert back to a single tensor."""
+        N = self.xyz.shape[0]
+        return torch.cat([
+            self.xyz,
+            self.scaling,
+            self.rotation,
+            self.opacity,
+            self.features_dc.squeeze(-1),  # reshape from (N, 3, 1) to (N, 3)
+            self.features_rest.reshape(N, -1), # (N, 3*(SH_coeffs - 1))
+        ], dim=1)
+
+
 def load_ply(path, sh_degree=0, fix_init=False):
     """
     Load a PLY file and return the point cloud data.
@@ -73,44 +110,16 @@ def load_ply(path, sh_degree=0, fix_init=False):
     else:
         new_xyz = xyz
         new_rotations = rotation
-    return [new_xyz, features_dc, features_rest, opacity, scaling, new_rotations]
 
-
-@dataclass
-class GaussianPrimitives:
-    xyz: torch.Tensor        # (N, 3)
-    scaling: torch.Tensor    # (N, 3)
-    rotation: torch.Tensor   # (N, 4)
-    features_dc: torch.Tensor# (N, 3, 1)
-    features_rest: torch.Tensor# (N, 3, SH_coeffs - 1)
-    opacity: torch.Tensor    # (N, 1)
-    
-    @classmethod
-    def from_tensor(cls, xyz, scaling, rotation, opacity, 
-                    features_dc=None, features_rest=None):
-        """
-        Decompose a tensor of shape (N, D) into GaussianPrimitives.
-        """
-        return cls(
-            xyz=xyz,
-            scaling=scaling,
-            rotation=rotation,
-            features_dc=features_dc,
-            features_rest=features_rest,
-            opacity=opacity
-        )
-    
-    def to_tensor(self) -> torch.Tensor:
-        """Convert back to a single tensor."""
-        N = self.xyz.shape[0]
-        return torch.cat([
-            self.xyz,
-            self.scaling,
-            self.rotation,
-            self.features_dc.squeeze(-1),  # reshape from (N, 3, 1) to (N, 3)
-            self.features_rest.reshape(N, -1), # (N, 3*(SH_coeffs - 1))
-            self.opacity
-        ], dim=1)
+    gaussians = GaussianPrimitives(
+        xyz=new_xyz,
+        scaling=scaling,
+        rotation=new_rotations,
+        opacity=opacity,
+        features_dc=features_dc,
+        features_rest=features_rest
+    )
+    return gaussians
 
 
 def make_covariance_3d(scale, quat):
@@ -127,12 +136,12 @@ def sqrtm_psd_3x3(mat, eps=1e-12):
     Matrix square‐root of a batch of symmetric PSD 3×3 matrices.
     mat: (..., 3, 3) → sqrt_mat: (..., 3, 3)
     """
-    # Eigen‐decompose
-    e, v = torch.linalg.eigh(mat)
+    # Eigen‐decompose: v @ diag(e) @ v.T
+    e, v = torch.linalg.eigh(mat) # e: (..., 3), v: (..., 3, 3)
     # clamp for numerical stability
     e_clamped = torch.clamp(e, min=eps)
-    sqrt_e = torch.sqrt(e_clamped)
-    return (v * sqrt_e.unsqueeze(-2)) @ v.transpose(-1, -2)
+    sqrt_e = torch.sqrt(e_clamped) # (..., 3)
+    return (v * sqrt_e.unsqueeze(-2)) @ v.transpose(-1, -2) # (..., 3, 3)
 
 def wasserstein_3d_gaussians(mu1, scale1, quat1, mu2, scale2, quat2):
     """
@@ -211,30 +220,35 @@ class DBSCAN:
 
         # Distance filter (vectorized)
         if candidate_idxs:
-            candidates = points[candidate_idxs] # (m, 3)
-            dists = torch.norm(candidates - pi, dim=1) # (m,)
+            #dists = torch.norm(candidates - pi, dim=1) # (m,)
+            # wasserstein distance
+            mu_candidates = gaussians.xyz[candidate_idxs]
+            scale_candidates = gaussians.scaling[candidate_idxs]
+            quat_candidates = gaussians.rotation[candidate_idxs]
+            mu1 = pi[None, :]
+            scale1 = gaussians.scaling[point_idx][None, :]
+            quat1 = gaussians.rotation[point_idx][None, :]
+            dists = wasserstein_3d_gaussians(mu1, scale1, quat1,  # dists.shape: (m,)
+                                             mu_candidates, scale_candidates, quat_candidates)
             neighbors = [idx for idx, d in zip(candidate_idxs, dists) if d <= self.eps and idx != point_idx]
         else:
             neighbors = []
 
         return neighbors
 
-    def fit(self, xyz, opacity, scaling, rotations):
+    def fit(self, gaussians):
         """
         Perform DBSCAN clustering on the input points.
         
         Args:
-            xyz: Tensor of shape (n_points, 3)
-            opacity: Tensor of shape (n_points, 1)
-            scaling: Tensor of shape (n_points, 3)
-            rotations: Tensor of shape (n_points, 4)
+            gaussians: GaussianPrimitives object
         
         Returns:
             labels: Tensor of shape (n_points,) containing cluster assignments
                    -1 indicates noise points
                    >= 0 indicates cluster assignments
         """
-        points = xyz
+        points = gaussians.xyz
         n_points = points.shape[0]
         labels = torch.full((n_points,), -2, dtype=torch.long)
         cluster_id = 0
@@ -260,7 +274,7 @@ class DBSCAN:
             if labels[point_idx] != -2: # already classified
                 continue
                 
-            neighbor_indices = self.find_neighbors(points, point_idx, voxel_coords, voxel_to_point_indices, key_to_index)
+            neighbor_indices = self.find_neighbors(gaussians, point_idx, voxel_coords, voxel_to_point_indices, key_to_index)
             
             if len(neighbor_indices) < self.min_pts:
                 labels[point_idx] = -1 # mark as noise
@@ -279,7 +293,7 @@ class DBSCAN:
                 elif labels[neighbor_idx] == -2: # if p' is unclassified, implicitly a core point or a border point
                     labels[neighbor_idx] = cluster_id
                     
-                    neighbor_neighbors = self.find_neighbors(points, neighbor_idx, voxel_coords, voxel_to_point_indices, key_to_index)
+                    neighbor_neighbors = self.find_neighbors(gaussians, neighbor_idx, voxel_coords, voxel_to_point_indices, key_to_index)
                     
                     if len(neighbor_neighbors) >= self.min_pts:
                         neighbor_indices = torch.cat([ # merge neighbor_neighbors into neighbor_indices
