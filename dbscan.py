@@ -3,6 +3,7 @@ import numpy as np
 from nerfstudio.utils.rotations import matrix_to_quaternion, quaternion_to_matrix
 from plyfile import PlyData
 from dataclasses import dataclass
+from tqdm import tqdm
 
 
 @dataclass
@@ -15,18 +16,24 @@ class GaussianPrimitives:
     features_rest: torch.Tensor# (N, 3, SH_coeffs - 1)
     
     @classmethod
-    def from_tensor(cls, xyz, scaling, rotation, opacity, 
-                    features_dc=None, features_rest=None):
+    def from_tensor(cls, gaussian_tensor: torch.Tensor):
         """
         Decompose a tensor of shape (N, D) into GaussianPrimitives.
         """
+        xyz = gaussian_tensor[:, :3]
+        scaling = gaussian_tensor[:, 3:6]
+        rotation = gaussian_tensor[:, 6:10]
+        opacity = gaussian_tensor[:, 10:11]
+        features_dc = gaussian_tensor[:, 11:14]
+        features_rest = gaussian_tensor[:, 14:]
+        N = xyz.shape[0]
         return cls(
             xyz=xyz,
             scaling=scaling,
             rotation=rotation,
             opacity=opacity,
-            features_dc=features_dc,
-            features_rest=features_rest,
+            features_dc=features_dc.reshape(N, 3, 1),
+            features_rest=features_rest.reshape(N, 3, -1)
         )
     
     def to_tensor(self) -> torch.Tensor:
@@ -127,6 +134,9 @@ def make_covariance_3d(scale, quat):
     Build a 3×3 covariance matrix from scale (std-devs) and unit quaternion.
     scale: (..., 3), quat: (..., 4) → cov: (..., 3, 3)
     """
+    if scale.shape[1] == 2: # 3DGS compatibility
+        scale = torch.cat([scale, torch.zeros_like(scale[..., :1])], dim=-1) # (..., 3)
+
     R = quaternion_to_matrix(quat)          # (..., 3, 3)
     D = torch.diag_embed(scale**2)          # (..., 3, 3)
     return R @ D @ R.transpose(-1, -2)      # (..., 3, 3)
@@ -225,16 +235,16 @@ class DBSCAN:
             mu_candidates = gaussians.xyz[candidate_idxs]
             scale_candidates = gaussians.scaling[candidate_idxs]
             quat_candidates = gaussians.rotation[candidate_idxs]
-            mu1 = pi[None, :]
-            scale1 = gaussians.scaling[point_idx][None, :]
-            quat1 = gaussians.rotation[point_idx][None, :]
+            mu1 = pi[None, :] # (1, 3)
+            scale1 = gaussians.scaling[point_idx][None, :] # (1, 3)
+            quat1 = gaussians.rotation[point_idx][None, :] # (1, 4)
             dists = wasserstein_3d_gaussians(mu1, scale1, quat1,  # dists.shape: (m,)
                                              mu_candidates, scale_candidates, quat_candidates)
             neighbors = [idx for idx, d in zip(candidate_idxs, dists) if d <= self.eps and idx != point_idx]
         else:
             neighbors = []
 
-        return neighbors
+        return torch.tensor(neighbors, device=device)
 
     def fit(self, gaussians):
         """
@@ -248,6 +258,7 @@ class DBSCAN:
                    -1 indicates noise points
                    >= 0 indicates cluster assignments
         """
+        import ipdb; ipdb.set_trace()
         points = gaussians.xyz
         n_points = points.shape[0]
         labels = torch.full((n_points,), -2, dtype=torch.long)
@@ -270,7 +281,7 @@ class DBSCAN:
         key_to_index = {k.item(): i for i, k in enumerate(unique_keys)}
 
         # Step 5: Iterate over points and classify
-        for point_idx in range(n_points):
+        for point_idx in tqdm(range(n_points), desc="DBSCAN clustering"):
             if labels[point_idx] != -2: # already classified
                 continue
                 
@@ -302,27 +313,29 @@ class DBSCAN:
                         ])
                 
                 i += 1
-        
         return labels
 
 # Example usage:
 if __name__ == "__main__":
-    # Create sample data
-    points = np.array([
-        [1, 2, 0], [2, 2, 0], [2, 3, 0],
-        [8, 7, 0], [8, 8, 0], [7, 8, 0],
-        [0, 1, 0], [5, 5, 0], [5, 6, 0],
-        [7, 6, 0], [10, 1, 0], [9, 2, 0]
-    ])
-    points = torch.tensor(points, dtype=torch.float)
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--path", type=str, required=True)
+    parser.add_argument("--sh_degree", type=int, default=3)
+    parser.add_argument("--fix_init", type=bool, default=False)
+    args = parser.parse_args()
+
+    gaussians = load_ply(args.path, args.sh_degree, args.fix_init)
+
+    print(gaussians.xyz.shape, gaussians.features_dc.shape, gaussians.features_rest.shape, gaussians.opacity.shape, gaussians.scaling.shape, gaussians.rotation.shape)
 
     # Parameters
     eps = 1.5
-    min_pts = 3
+    min_pts = 20
     
     # Initialize and run DBSCAN
     dbscan = DBSCAN(eps=eps, min_pts=min_pts)
-    labels = dbscan.fit(points)
+    labels = dbscan.fit(gaussians)
     
     print(f"Number of clusters: {labels.max().item() + 1}")
     print(f"Number of noise points: {(labels == -1).sum().item()}")
