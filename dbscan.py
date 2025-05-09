@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from nerfstudio.utils.rotations import matrix_to_quaternion, quaternion_to_matrix
 from plyfile import PlyData
+from dataclasses import dataclass
 
 
 def load_ply(path, sh_degree=0, fix_init=False):
@@ -75,6 +76,93 @@ def load_ply(path, sh_degree=0, fix_init=False):
     return [new_xyz, features_dc, features_rest, opacity, scaling, new_rotations]
 
 
+@dataclass
+class GaussianPrimitives:
+    xyz: torch.Tensor        # (N, 3)
+    scaling: torch.Tensor    # (N, 3)
+    rotation: torch.Tensor   # (N, 4)
+    features_dc: torch.Tensor# (N, 3, 1)
+    features_rest: torch.Tensor# (N, 3, SH_coeffs - 1)
+    opacity: torch.Tensor    # (N, 1)
+    
+    @classmethod
+    def from_tensor(cls, xyz, scaling, rotation, opacity, 
+                    features_dc=None, features_rest=None):
+        """
+        Decompose a tensor of shape (N, D) into GaussianPrimitives.
+        """
+        return cls(
+            xyz=xyz,
+            scaling=scaling,
+            rotation=rotation,
+            features_dc=features_dc,
+            features_rest=features_rest,
+            opacity=opacity
+        )
+    
+    def to_tensor(self) -> torch.Tensor:
+        """Convert back to a single tensor."""
+        N = self.xyz.shape[0]
+        return torch.cat([
+            self.xyz,
+            self.scaling,
+            self.rotation,
+            self.features_dc.squeeze(-1),  # reshape from (N, 3, 1) to (N, 3)
+            self.features_rest.reshape(N, -1), # (N, 3*(SH_coeffs - 1))
+            self.opacity
+        ], dim=1)
+
+
+def make_covariance_3d(scale, quat):
+    """
+    Build a 3×3 covariance matrix from scale (std-devs) and unit quaternion.
+    scale: (..., 3), quat: (..., 4) → cov: (..., 3, 3)
+    """
+    R = quaternion_to_matrix(quat)          # (..., 3, 3)
+    D = torch.diag_embed(scale**2)          # (..., 3, 3)
+    return R @ D @ R.transpose(-1, -2)      # (..., 3, 3)
+
+def sqrtm_psd_3x3(mat, eps=1e-12):
+    """
+    Matrix square‐root of a batch of symmetric PSD 3×3 matrices.
+    mat: (..., 3, 3) → sqrt_mat: (..., 3, 3)
+    """
+    # Eigen‐decompose
+    e, v = torch.linalg.eigh(mat)
+    # clamp for numerical stability
+    e_clamped = torch.clamp(e, min=eps)
+    sqrt_e = torch.sqrt(e_clamped)
+    return (v * sqrt_e.unsqueeze(-2)) @ v.transpose(-1, -2)
+
+def wasserstein_3d_gaussians(mu1, scale1, quat1, mu2, scale2, quat2):
+    """
+    Squared 2‐Wasserstein distance between two 3D Gaussian splats.
+    
+    Args:
+      mu1, mu2     : (..., 3)
+      scale1, scale2 : (..., 3) positive std-devs
+      quat1, quat2 : (..., 4) unit quaternions
+    Returns:
+      W2^2: tensor of shape (...)
+    """
+    # Build covariance matrices
+    cov1 = make_covariance_3d(scale1, quat1)   # (..., 3, 3)
+    cov2 = make_covariance_3d(scale2, quat2)   # (..., 3, 3)
+
+    # Squared distance between means
+    mean_term = torch.sum((mu1 - mu2)**2, dim=-1)  # (...)
+
+    # Compute the cross term sqrtm(cov2^(1/2) cov1 cov2^(1/2))
+    sqrt_cov2 = sqrtm_psd_3x3(cov2)                # (..., 3, 3)
+    inner = sqrt_cov2 @ cov1 @ sqrt_cov2.transpose(-1, -2)
+    sqrt_inner = sqrtm_psd_3x3(inner)              # (..., 3, 3)
+
+    # Trace term
+    trace_term = torch.diagonal(cov1 + cov2 - 2*sqrt_inner, dim1=-2, dim2=-1).sum(-1)  # (...)
+
+    return mean_term + trace_term
+
+
 class DBSCAN:
     def __init__(self, eps, min_pts):
         """
@@ -101,10 +189,11 @@ class DBSCAN:
         offsets = torch.tensor([-1, 0, 1], device=device)
         return torch.cartesian_prod(offsets, offsets, offsets)  # (27, 3)
 
-    def find_neighbors(self, points, point_idx, voxel_coords, voxel_to_point_indices, key_to_index):
+    def find_neighbors(self, gaussians, point_idx, voxel_coords, voxel_to_point_indices, key_to_index):
         """
         Find neighbors of a single point at index `point_idx` within radius `eps`.
         """
+        points = gaussians.xyz
         device = points.device
         pi = points[point_idx] # (3,)
         vi = voxel_coords[point_idx] # (3,)
@@ -130,18 +219,22 @@ class DBSCAN:
 
         return neighbors
 
-    def fit(self, points):
+    def fit(self, xyz, opacity, scaling, rotations):
         """
         Perform DBSCAN clustering on the input points.
         
         Args:
-            points: Tensor of shape (n_points, n_features)
+            xyz: Tensor of shape (n_points, 3)
+            opacity: Tensor of shape (n_points, 1)
+            scaling: Tensor of shape (n_points, 3)
+            rotations: Tensor of shape (n_points, 4)
         
         Returns:
             labels: Tensor of shape (n_points,) containing cluster assignments
                    -1 indicates noise points
                    >= 0 indicates cluster assignments
         """
+        points = xyz
         n_points = points.shape[0]
         labels = torch.full((n_points,), -2, dtype=torch.long)
         cluster_id = 0
