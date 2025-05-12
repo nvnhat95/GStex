@@ -1,9 +1,12 @@
+import math
+import time
 import torch
 import numpy as np
 from nerfstudio.utils.rotations import matrix_to_quaternion, quaternion_to_matrix
 from plyfile import PlyData
 from dataclasses import dataclass
 from tqdm import tqdm
+from nerfstudio.cameras.cameras import Cameras
 
 
 @dataclass
@@ -193,6 +196,37 @@ class DBSCAN:
         """
         self.eps = eps
         self.min_pts = min_pts
+
+    def set_level(self, points, cameras: Cameras, dist_ratio=0.95, levels=-1):
+        all_dist = torch.tensor([])
+        camera_centers = cameras.camera_to_worlds[..., 3][:, :3]  # Get camera centers from transform matrix
+        for cam_center in camera_centers:
+            dist = torch.sqrt(torch.sum((points - cam_center)**2, dim=1))
+            dist_max = torch.quantile(dist, dist_ratio)
+            dist_min = torch.quantile(dist, 1 - dist_ratio)
+            new_dist = torch.tensor([dist_min, dist_max]).float()
+            all_dist = torch.cat((all_dist, new_dist), dim=0)
+        dist_max = torch.quantile(all_dist, dist_ratio)
+        dist_min = torch.quantile(all_dist, 1 - dist_ratio)
+        self.standard_dist = dist_max
+        if levels == -1:
+            self.levels = torch.round(torch.log2(dist_max/dist_min)/math.log2(self.fork)).int().item() + 1
+        else:
+            self.levels = levels
+            
+    def octree_sample(self, data, init_pos, device="cuda"):
+        torch.cuda.synchronize(); t0 = time.time()
+        self.positions = torch.empty(0, 3).float().to(device)
+        self._level = torch.empty(0).int().to(device) 
+        for cur_level in range(self.levels):
+            cur_size = self.voxel_size/(float(self.fork) ** cur_level)
+            new_positions = torch.unique(torch.round((data - init_pos) / cur_size), dim=0) * cur_size + init_pos
+            new_level = torch.ones(new_positions.shape[0], dtype=torch.int, device=device) * cur_level
+            self.positions = torch.concat((self.positions, new_positions), dim=0)
+            self._level = torch.concat((self._level, new_level), dim=0)
+        torch.cuda.synchronize(); t1 = time.time()
+        time_diff = t1 - t0
+        print(f"Building octree time: {int(time_diff // 60)} min {time_diff % 60} sec")
 
     def voxelize(self, points):
         """Map points to voxel indices (as integer coordinates)."""
