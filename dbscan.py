@@ -217,13 +217,51 @@ class DBSCAN:
     def octree_sample(self, data, init_pos, device="cuda"):
         torch.cuda.synchronize(); t0 = time.time()
         self.positions = torch.empty(0, 3).float().to(device)
-        self._level = torch.empty(0).int().to(device) 
+        self._level = torch.empty(0).int().to(device)
+        self.point_to_voxel_idx = torch.full((data.shape[0],), -1, dtype=torch.long, device=device)
+        
+        # Keep track of unassigned points
+        unassigned_mask = torch.ones(data.shape[0], dtype=torch.bool, device=device)
+        
         for cur_level in range(self.levels):
+            if not unassigned_mask.any():  # Exit early if all points are assigned
+                break
+            
+            # Get current unassigned points
+            unassigned_points = data[unassigned_mask]
+            
             cur_size = self.voxel_size/(float(self.fork) ** cur_level)
-            new_positions = torch.unique(torch.round((data - init_pos) / cur_size), dim=0) * cur_size + init_pos
-            new_level = torch.ones(new_positions.shape[0], dtype=torch.int, device=device) * cur_level
-            self.positions = torch.concat((self.positions, new_positions), dim=0)
-            self._level = torch.concat((self._level, new_level), dim=0)
+            # Map points to voxel coordinates
+            voxel_coords = torch.round((unassigned_points - init_pos) / cur_size)
+            unique_voxels, inverse_indices, counts = torch.unique(voxel_coords, dim=0, return_inverse=True, return_counts=True)
+            
+            # Only assign points to voxels that have enough density
+            dense_voxel_mask = counts >= self.min_points_per_voxel  # New threshold parameter needed
+            dense_voxel_indices = torch.where(dense_voxel_mask)[0]
+            
+            if len(dense_voxel_indices) > 0:
+                # Filter to keep only points in dense voxels
+                points_in_dense_voxels = torch.isin(inverse_indices, dense_voxel_indices)
+                filtered_inverse_indices = inverse_indices[points_in_dense_voxels]
+                
+                # Update positions for dense voxels only
+                new_positions = unique_voxels[dense_voxel_mask] * cur_size + init_pos
+                new_level = torch.ones(new_positions.shape[0], dtype=torch.int, device=device) * cur_level
+                
+                # Get indices of points that will be assigned in this level
+                unassigned_indices = torch.where(unassigned_mask)[0][points_in_dense_voxels]
+                
+                # Update point assignments for current level
+                offset = self.positions.shape[0]
+                self.point_to_voxel_idx[unassigned_indices] = filtered_inverse_indices + offset
+                
+                # Mark only the assigned points as processed
+                unassigned_mask[unassigned_indices] = False
+                
+                # Append new voxel centers and levels
+                self.positions = torch.cat((self.positions, new_positions), dim=0)
+                self._level = torch.cat((self._level, new_level), dim=0)
+        
         torch.cuda.synchronize(); t1 = time.time()
         time_diff = t1 - t0
         print(f"Building octree time: {int(time_diff // 60)} min {time_diff % 60} sec")
