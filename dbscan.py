@@ -7,6 +7,9 @@ from plyfile import PlyData
 from dataclasses import dataclass
 from tqdm import tqdm
 from nerfstudio.cameras.cameras import Cameras
+import torch.nn.functional as F
+from pytorch3d.structures import Pointclouds
+from pytorch3d.ops import ball_query, knn_points
 
 
 @dataclass
@@ -215,10 +218,15 @@ class DBSCAN:
             self.levels = levels
             
     def octree_sample(self, data, init_pos, device="cuda"):
+        """
+        Inputs:
+            data: (N, 3)
+            init_pos: (3,)
+        """
         torch.cuda.synchronize(); t0 = time.time()
-        self.positions = torch.empty(0, 3).float().to(device)
-        self._level = torch.empty(0).int().to(device)
-        self.point_to_voxel_idx = torch.full((data.shape[0],), -1, dtype=torch.long, device=device)
+        self.positions = torch.empty(0, 3).float().to(device) # positions of voxel centers
+        self._level = torch.empty(0).int().to(device) # level of voxel centers
+        self.point_to_voxel_idx = torch.full((data.shape[0],), -1, dtype=torch.long, device=device) 
         
         # Keep track of unassigned points
         unassigned_mask = torch.ones(data.shape[0], dtype=torch.bool, device=device)
@@ -228,25 +236,25 @@ class DBSCAN:
                 break
             
             # Get current unassigned points
-            unassigned_points = data[unassigned_mask]
-            unassigned_indices = torch.where(unassigned_mask)[0]
+            unassigned_points = data[unassigned_mask] # (N, 3)
+            unassigned_indices = torch.where(unassigned_mask)[0] # (N,)
             
             cur_size = self.voxel_size/(float(self.fork) ** cur_level) # smaller as level increases
 
             # Map points to voxel coordinates
-            voxel_coords = torch.round((unassigned_points - init_pos) / cur_size)
-            unique_voxels, inverse_indices, counts = torch.unique(voxel_coords, dim=0, return_inverse=True, return_counts=True)
+            voxel_coords = torch.round((unassigned_points - init_pos) / cur_size) # (N, 3)
+            unique_voxels, inverse_indices, counts = torch.unique(voxel_coords, dim=0, return_inverse=True, return_counts=True) # (V, 3), (N,), (V,)
             
             # Only assign points to voxels that have enough density
-            dense_voxel_mask = counts >= self.min_points_per_voxel
-            points_in_dense_voxels = torch.isin(inverse_indices, torch.where(dense_voxel_mask)[0])
+            dense_voxel_mask = counts >= self.min_points_per_voxel # (V,)
+            points_in_dense_voxels = torch.isin(inverse_indices, torch.where(dense_voxel_mask)[0]) # (N,)
             
             if points_in_dense_voxels.any():
                 # Get indices of points that will be assigned in this level
-                points_to_assign = unassigned_indices[points_in_dense_voxels]
+                points_to_assign = unassigned_indices[points_in_dense_voxels] # (P,), P > V
                 
                 # The point index becomes the voxel index
-                self.point_to_voxel_idx[points_to_assign] = points_to_assign
+                self.point_to_voxel_idx[points_to_assign] = points_to_assign # (P,)
                 
                 # Mark these points as assigned
                 unassigned_mask[points_to_assign] = False
@@ -384,6 +392,40 @@ class DBSCAN:
                 i += 1
         return labels
 
+    def octree_sample_pytorch3d(self, data, device="cuda", max_depth=10):
+        """
+        Use PyTorch3D for octree-like sampling.
+        """
+        torch.cuda.synchronize(); t0 = time.time()
+        
+        point_to_voxel_idx, voxel_centers, voxel_levels = build_octree_with_pytorch3d(
+            data, max_depth=max_depth, min_points_per_voxel=self.min_pts, device=device
+        )
+        
+        self.point_to_voxel_idx = point_to_voxel_idx
+        self.positions = voxel_centers
+        self._level = voxel_levels
+        
+        torch.cuda.synchronize(); t1 = time.time()
+        print(f"PyTorch3D octree time: {int((t1-t0) // 60)} min {(t1-t0) % 60:.2f} sec")
+
+    def find_neighbors_pytorch3d(self, gaussians, point_idx):
+        """
+        Find neighbors using PyTorch3D's ball_query.
+        """
+        points = gaussians.xyz
+        query_point = points[point_idx].unsqueeze(0)  # (1, 3)
+        
+        neighbor_lists = efficient_neighbor_search_pytorch3d(
+            points, query_point, self.eps, device=points.device
+        )
+        
+        neighbors = neighbor_lists[0]  # Get neighbors for the single query point
+        # Remove self if present
+        neighbors = neighbors[neighbors != point_idx]
+        
+        return neighbors
+
 # Example usage:
 if __name__ == "__main__":
     import argparse
@@ -408,4 +450,152 @@ if __name__ == "__main__":
     
     print(f"Number of clusters: {labels.max().item() + 1}")
     print(f"Number of noise points: {(labels == -1).sum().item()}")
+
+
+def build_octree_with_pytorch3d(points, max_depth=10, min_points_per_voxel=20, device="cuda"):
+    """
+    Build octree-like structure using PyTorch3D operations.
+    
+    Args:
+        points: torch.Tensor of shape (N, 3)
+        max_depth: Maximum octree depth
+        min_points_per_voxel: Minimum points required for a voxel
+    
+    Returns:
+        point_to_voxel_idx: torch.Tensor mapping each point to its voxel representative
+        voxel_centers: torch.Tensor of voxel center positions
+        voxel_levels: torch.Tensor of depth level for each voxel
+    """
+    points = points.to(device)
+    N = points.shape[0]
+    
+    # Initialize outputs
+    point_to_voxel_idx = torch.full((N,), -1, dtype=torch.long, device=device)
+    voxel_centers = []
+    voxel_levels = []
+    
+    # Compute bounding box
+    min_coords = points.min(dim=0)[0]
+    max_coords = points.max(dim=0)[0]
+    bbox_size = (max_coords - min_coords).max()
+    bbox_center = (min_coords + max_coords) / 2
+    
+    # Track unassigned points
+    unassigned_mask = torch.ones(N, dtype=torch.bool, device=device)
+    
+    for level in range(max_depth):
+        if not unassigned_mask.any():
+            break
+            
+        # Current voxel size at this level
+        voxel_size = bbox_size / (2 ** level)
+        
+        # Get unassigned points
+        unassigned_points = points[unassigned_mask]
+        unassigned_indices = torch.where(unassigned_mask)[0]
+        
+        if len(unassigned_points) == 0:
+            break
+        
+        # Compute voxel coordinates
+        voxel_coords = torch.floor((unassigned_points - (bbox_center - bbox_size/2)) / voxel_size).long()
+        
+        # Find unique voxels and their point counts
+        unique_voxels, inverse_indices, counts = torch.unique(
+            voxel_coords, dim=0, return_inverse=True, return_counts=True
+        )
+        
+        # Filter for dense voxels
+        dense_mask = counts >= min_points_per_voxel
+        if not dense_mask.any():
+            continue
+            
+        dense_voxels = unique_voxels[dense_mask]
+        
+        # Process each dense voxel
+        for i, voxel_coord in enumerate(dense_voxels):
+            # Find points in this voxel
+            voxel_idx_in_unique = torch.where(dense_mask)[0][i]
+            points_in_voxel_mask = (inverse_indices == voxel_idx_in_unique)
+            points_in_voxel = unassigned_indices[points_in_voxel_mask]
+            
+            if len(points_in_voxel) == 0:
+                continue
+                
+            # Compute voxel center in world coordinates
+            voxel_center_world = (bbox_center - bbox_size/2) + (voxel_coord.float() + 0.5) * voxel_size
+            
+            # Find closest point to voxel center using PyTorch3D's knn_points
+            voxel_points = points[points_in_voxel].unsqueeze(0)  # (1, M, 3)
+            query_point = voxel_center_world.unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
+            
+            # Use knn to find closest point
+            _, closest_idx, _ = knn_points(query_point, voxel_points, K=1)
+            closest_local_idx = closest_idx[0, 0, 0]  # Extract scalar index
+            closest_global_idx = points_in_voxel[closest_local_idx]
+            
+            # Assign all points in voxel to the closest point
+            point_to_voxel_idx[points_in_voxel] = closest_global_idx
+            
+            # Mark points as assigned
+            unassigned_mask[points_in_voxel] = False
+            
+            # Store voxel info
+            voxel_centers.append(points[closest_global_idx])
+            voxel_levels.append(level)
+    
+    # Convert to tensors
+    if voxel_centers:
+        voxel_centers = torch.stack(voxel_centers)
+        voxel_levels = torch.tensor(voxel_levels, dtype=torch.int, device=device)
+    else:
+        voxel_centers = torch.empty(0, 3, device=device)
+        voxel_levels = torch.empty(0, dtype=torch.int, device=device)
+    
+    return point_to_voxel_idx, voxel_centers, voxel_levels
+
+
+def efficient_neighbor_search_pytorch3d(points, query_points, radius, device="cuda"):
+    """
+    Efficient neighbor search using PyTorch3D's ball_query.
+    
+    Args:
+        points: torch.Tensor of shape (N, 3) - all points
+        query_points: torch.Tensor of shape (M, 3) - query points  
+        radius: float - search radius
+        
+    Returns:
+        neighbor_lists: List of tensors, each containing neighbor indices for a query point
+    """
+    points = points.to(device)
+    query_points = query_points.to(device)
+    
+    # PyTorch3D expects batch dimension
+    points_batch = points.unsqueeze(0)  # (1, N, 3)
+    query_batch = query_points.unsqueeze(0)  # (1, M, 3)
+    
+    # Use ball_query to find neighbors within radius
+    # Note: ball_query returns fixed K neighbors, so we use a large K and filter
+    max_neighbors = min(points.shape[0], 1000)  # Reasonable upper bound
+    
+    _, neighbor_indices, _ = ball_query(
+        query_batch, points_batch, 
+        radius=radius, 
+        K=max_neighbors,
+        return_nn=False
+    )
+    
+    # Process results
+    neighbor_lists = []
+    for i in range(query_points.shape[0]):
+        # Get neighbors for this query point
+        neighbors = neighbor_indices[0, i]  # (K,)
+        
+        # Filter out invalid neighbors (ball_query pads with -1)
+        valid_mask = neighbors >= 0
+        valid_neighbors = neighbors[valid_mask]
+        
+        neighbor_lists.append(valid_neighbors)
+    
+    return neighbor_lists
 
