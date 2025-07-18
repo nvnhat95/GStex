@@ -157,6 +157,22 @@ class BallQueryDBSCAN:
             valid_mask = candidates >= 0
             candidate_indices = candidates[valid_mask]
             
+            # Debug: Check if we're getting too many candidates
+            if len(candidate_indices) > points.shape[0] * 0.8:  # More than 80% of points
+                print(f"Warning: Ball query found {len(candidate_indices)}/{points.shape[0]} candidates (search_radius={search_radius:.3f})")
+                # Reduce to smaller radius for this query
+                reduced_radius = self.eps * 0.5  # Use smaller radius
+                _, neighbor_indices, _ = ball_query(
+                    query_point, all_points,
+                    radius=reduced_radius,
+                    K=max_neighbors,
+                    return_nn=False
+                )
+                candidates = neighbor_indices[0, 0]
+                valid_mask = candidates >= 0
+                candidate_indices = candidates[valid_mask]
+                print(f"Reduced search found {len(candidate_indices)} candidates")
+            
         except Exception as e:
             # Fallback: if ball_query fails, use all points as candidates
             print(f"Ball query failed: {e}. Using all points as candidates.")
@@ -293,10 +309,37 @@ class BallQueryDBSCAN:
 if __name__ == "__main__":
     # Example with synthetic data
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
     
-    # Create some synthetic Gaussian primitives for testing
+    # Create some synthetic Gaussian primitives with more separated clusters
     n_points = 1000
-    xyz = torch.randn(n_points, 3, device=device)
+    n_clusters = 5
+    cluster_size = n_points // n_clusters
+    
+    # Create separated cluster centers
+    cluster_centers = torch.tensor([
+        [0.0, 0.0, 0.0],
+        [5.0, 0.0, 0.0], 
+        [0.0, 5.0, 0.0],
+        [0.0, 0.0, 5.0],
+        [5.0, 5.0, 0.0]
+    ], device=device)
+    
+    xyz_list = []
+    for i in range(n_clusters):
+        # Generate points around each cluster center
+        cluster_points = cluster_centers[i] + torch.randn(cluster_size, 3, device=device) * 0.5
+        xyz_list.append(cluster_points)
+    
+    # Add remaining points as noise
+    remaining = n_points - n_clusters * cluster_size
+    if remaining > 0:
+        noise_points = torch.randn(remaining, 3, device=device) * 10.0  # Spread out noise
+        xyz_list.append(noise_points)
+    
+    xyz = torch.cat(xyz_list, dim=0)
+    
+    # Generate other properties
     scaling = torch.abs(torch.randn(n_points, 3, device=device)) * 0.1
     rotation = torch.randn(n_points, 4, device=device)
     rotation = rotation / torch.norm(rotation, dim=1, keepdim=True)  # Normalize quaternions
@@ -313,11 +356,18 @@ if __name__ == "__main__":
         features_rest=features_rest
     )
     
-    # Run DBSCAN
-    eps = 1.0
+    # Print some stats about the data
+    print(f"Generated {n_points} points")
+    print(f"Point cloud bounds: {xyz.min(dim=0)[0]} to {xyz.max(dim=0)[0]}")
+    print(f"Mean pairwise distance: {torch.cdist(xyz[:100], xyz[:100]).mean():.3f}")
+    
+    # Run DBSCAN with appropriate parameters for this scale
+    eps = 2.0  # Increased eps for the larger scale
     min_pts = 10
     
-    dbscan = BallQueryDBSCAN(eps=eps, min_pts=min_pts)
+    print(f"Running DBSCAN with eps={eps}, min_pts={min_pts}")
+    
+    dbscan = BallQueryDBSCAN(eps=eps, min_pts=min_pts, search_radius_multiplier=1.5)
     labels = dbscan.fit(gaussians)
     
     # Analyze results
@@ -326,6 +376,8 @@ if __name__ == "__main__":
     print(f"Number of clusters: {results['n_clusters']}")
     print(f"Number of noise points: {results['n_noise_points']}")
     print(f"Noise ratio: {results['noise_ratio']:.2%}")
-    print(f"Average cluster size: {results['avg_cluster_size']:.1f}")
-    print(f"Largest cluster: {results['largest_cluster_size']} points")
-    print(f"Smallest cluster: {results['smallest_cluster_size']} points") 
+    if results['cluster_sizes']:
+        print(f"Average cluster size: {results['avg_cluster_size']:.1f}")
+        print(f"Largest cluster: {results['largest_cluster_size']} points")
+        print(f"Smallest cluster: {results['smallest_cluster_size']} points")
+        print(f"Cluster sizes: {sorted(results['cluster_sizes'], reverse=True)}") 
