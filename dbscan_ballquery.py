@@ -1,0 +1,331 @@
+import torch
+import numpy as np
+from tqdm import tqdm
+from pytorch3d.ops import ball_query
+from nerfstudio.utils.rotations import quaternion_to_matrix
+from dataclasses import dataclass
+
+
+@dataclass
+class GaussianPrimitives:
+    xyz: torch.Tensor        # (N, 3)
+    scaling: torch.Tensor    # (N, 3)
+    rotation: torch.Tensor   # (N, 4)
+    opacity: torch.Tensor    # (N, 1)
+    features_dc: torch.Tensor# (N, 3, 1)
+    features_rest: torch.Tensor# (N, 3, SH_coeffs - 1)
+    
+    @classmethod
+    def from_tensor(cls, gaussian_tensor: torch.Tensor):
+        """
+        Decompose a tensor of shape (N, D) into GaussianPrimitives.
+        """
+        xyz = gaussian_tensor[:, :3]
+        scaling = gaussian_tensor[:, 3:6]
+        rotation = gaussian_tensor[:, 6:10]
+        opacity = gaussian_tensor[:, 10:11]
+        features_dc = gaussian_tensor[:, 11:14]
+        features_rest = gaussian_tensor[:, 14:]
+        N = xyz.shape[0]
+        return cls(
+            xyz=xyz,
+            scaling=scaling,
+            rotation=rotation,
+            opacity=opacity,
+            features_dc=features_dc.reshape(N, 3, 1),
+            features_rest=features_rest.reshape(N, 3, -1)
+        )
+    
+    def to_tensor(self) -> torch.Tensor:
+        """Convert back to a single tensor."""
+        N = self.xyz.shape[0]
+        return torch.cat([
+            self.xyz,
+            self.scaling,
+            self.rotation,
+            self.opacity,
+            self.features_dc.squeeze(-1),  # reshape from (N, 3, 1) to (N, 3)
+            self.features_rest.reshape(N, -1), # (N, 3*(SH_coeffs - 1))
+        ], dim=1)
+
+
+def make_covariance_3d(scale, quat):
+    """
+    Build a 3×3 covariance matrix from scale (std-devs) and unit quaternion.
+    scale: (..., 3), quat: (..., 4) → cov: (..., 3, 3)
+    """
+    if scale.shape[1] == 2: # 3DGS compatibility
+        scale = torch.cat([scale, torch.zeros_like(scale[..., :1])], dim=-1) # (..., 3)
+
+    R = quaternion_to_matrix(quat)          # (..., 3, 3)
+    D = torch.diag_embed(scale**2)          # (..., 3, 3)
+    return R @ D @ R.transpose(-1, -2)      # (..., 3, 3)
+
+
+def sqrtm_psd_3x3(mat, eps=1e-12):
+    """
+    Matrix square‐root of a batch of symmetric PSD 3×3 matrices.
+    mat: (..., 3, 3) → sqrt_mat: (..., 3, 3)
+    """
+    # Eigen‐decompose: v @ diag(e) @ v.T
+    e, v = torch.linalg.eigh(mat) # e: (..., 3), v: (..., 3, 3)
+    # clamp for numerical stability
+    e_clamped = torch.clamp(e, min=eps)
+    sqrt_e = torch.sqrt(e_clamped) # (..., 3)
+    return (v * sqrt_e.unsqueeze(-2)) @ v.transpose(-1, -2) # (..., 3, 3)
+
+
+def wasserstein_3d_gaussians(mu1, scale1, quat1, mu2, scale2, quat2):
+    """
+    Squared 2‐Wasserstein distance between two 3D Gaussian splats.
+    
+    Args:
+      mu1, mu2     : (..., 3)
+      scale1, scale2 : (..., 3) positive std-devs
+      quat1, quat2 : (..., 4) unit quaternions
+    Returns:
+      W2^2: tensor of shape (...)
+    """
+    # Build covariance matrices
+    cov1 = make_covariance_3d(scale1, quat1)   # (..., 3, 3)
+    cov2 = make_covariance_3d(scale2, quat2)   # (..., 3, 3)
+
+    # Squared distance between means
+    mean_term = torch.sum((mu1 - mu2)**2, dim=-1)  # (...)
+
+    # Compute the cross term sqrtm(cov2^(1/2) cov1 cov2^(1/2))
+    sqrt_cov2 = sqrtm_psd_3x3(cov2)                # (..., 3, 3)
+    inner = sqrt_cov2 @ cov1 @ sqrt_cov2.transpose(-1, -2)
+    sqrt_inner = sqrtm_psd_3x3(inner)              # (..., 3, 3)
+
+    # Trace term
+    trace_term = torch.diagonal(cov1 + cov2 - 2*sqrt_inner, dim1=-2, dim2=-1).sum(-1)  # (...)
+
+    return mean_term + trace_term
+
+
+class BallQueryDBSCAN:
+    def __init__(self, eps, min_pts, search_radius_multiplier=2.0):
+        """
+        Initialize ball query-based DBSCAN clustering algorithm for Gaussian Splats.
+        
+        Args:
+            eps: Maximum wasserstein distance for points to be considered neighbors
+            min_pts: Minimum number of points required to form a cluster
+            search_radius_multiplier: Multiplier for initial ball_query radius 
+                                    (since Euclidean != Wasserstein distance)
+        """
+        self.eps = eps
+        self.min_pts = min_pts
+        self.search_radius_multiplier = search_radius_multiplier
+
+    def find_neighbors(self, gaussians, point_idx):
+        """
+        Find neighbors of a single point using PyTorch3D's ball_query and wasserstein distance.
+        
+        Args:
+            gaussians: GaussianPrimitives object
+            point_idx: Index of the query point
+            
+        Returns:
+            neighbors: Tensor of neighbor indices within wasserstein distance eps
+        """
+        points = gaussians.xyz
+        device = points.device
+        
+        # Query point
+        query_point = points[point_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
+        all_points = points.unsqueeze(0)  # (1, N, 3)
+        
+        # Use ball_query to get initial candidates within Euclidean radius
+        # We use a larger radius since wasserstein distance can be different from Euclidean
+        search_radius = self.eps * self.search_radius_multiplier
+        
+        # Set K to a reasonable upper bound (or all points if dataset is small)
+        max_neighbors = min(points.shape[0], 1000)
+        
+        try:
+            _, neighbor_indices, _ = ball_query(
+                query_point, all_points,
+                radius=search_radius,
+                K=max_neighbors,
+                return_nn=False
+            )
+            
+            # Extract valid neighbors (ball_query pads with -1)
+            candidates = neighbor_indices[0, 0]  # (K,)
+            valid_mask = candidates >= 0
+            candidate_indices = candidates[valid_mask]
+            
+        except Exception as e:
+            # Fallback: if ball_query fails, use all points as candidates
+            print(f"Ball query failed: {e}. Using all points as candidates.")
+            candidate_indices = torch.arange(points.shape[0], device=device)
+        
+        # Remove self from candidates
+        candidate_indices = candidate_indices[candidate_indices != point_idx]
+        
+        if len(candidate_indices) == 0:
+            return torch.tensor([], dtype=torch.long, device=device)
+        
+        # Compute wasserstein distances for all candidates
+        query_mu = gaussians.xyz[point_idx].unsqueeze(0)  # (1, 3)
+        query_scale = gaussians.scaling[point_idx].unsqueeze(0)  # (1, 3)
+        query_quat = gaussians.rotation[point_idx].unsqueeze(0)  # (1, 4)
+        
+        candidate_mu = gaussians.xyz[candidate_indices]  # (M, 3)
+        candidate_scale = gaussians.scaling[candidate_indices]  # (M, 3)
+        candidate_quat = gaussians.rotation[candidate_indices]  # (M, 4)
+        
+        # Compute wasserstein distances
+        wasserstein_dists = wasserstein_3d_gaussians(
+            query_mu, query_scale, query_quat,
+            candidate_mu, candidate_scale, candidate_quat
+        )  # (M,)
+        
+        # Filter neighbors based on wasserstein distance threshold
+        valid_neighbors_mask = wasserstein_dists <= self.eps
+        neighbors = candidate_indices[valid_neighbors_mask]
+        
+        return neighbors
+
+    def fit(self, gaussians):
+        """
+        Perform DBSCAN clustering on Gaussian Splats using ball query for neighbor search.
+        
+        Args:
+            gaussians: GaussianPrimitives object
+        
+        Returns:
+            labels: Tensor of shape (n_points,) containing cluster assignments
+                   -1 indicates noise points
+                   >= 0 indicates cluster assignments
+        """
+        points = gaussians.xyz
+        n_points = points.shape[0]
+        device = points.device
+        
+        # Initialize labels: -2 = unclassified, -1 = noise, >= 0 = cluster ID
+        labels = torch.full((n_points,), -2, dtype=torch.long, device=device)
+        cluster_id = 0
+
+        print(f"Starting ball query-based DBSCAN clustering on {n_points} Gaussian splats...")
+        print(f"Parameters: eps={self.eps}, min_pts={self.min_pts}")
+
+        # Iterate over all points
+        for point_idx in tqdm(range(n_points), desc="DBSCAN clustering"):
+            if labels[point_idx] != -2:  # Skip if already classified
+                continue
+                
+            # Find neighbors using ball query + wasserstein distance
+            neighbor_indices = self.find_neighbors(gaussians, point_idx)
+            
+            # Check if point is a core point
+            if len(neighbor_indices) < self.min_pts:
+                labels[point_idx] = -1  # Mark as noise
+                continue
+                
+            # Start new cluster
+            cluster_id += 1
+            labels[point_idx] = cluster_id
+            
+            # Convert to list for dynamic expansion
+            neighbor_list = neighbor_indices.tolist()
+            
+            # Expand cluster using neighbors
+            i = 0
+            while i < len(neighbor_list):
+                neighbor_idx = neighbor_list[i]
+                
+                if labels[neighbor_idx] == -1:  # Convert noise to border point
+                    labels[neighbor_idx] = cluster_id
+                elif labels[neighbor_idx] == -2:  # Unclassified point
+                    labels[neighbor_idx] = cluster_id
+                    
+                    # Check if this neighbor is also a core point
+                    neighbor_neighbors = self.find_neighbors(gaussians, neighbor_idx)
+                    
+                    if len(neighbor_neighbors) >= self.min_pts:
+                        # Add new neighbors to expansion list (avoid duplicates)
+                        for nn in neighbor_neighbors:
+                            if nn.item() not in neighbor_list:
+                                neighbor_list.append(nn.item())
+                
+                i += 1
+        
+        return labels
+
+    def analyze_clusters(self, labels):
+        """
+        Analyze clustering results.
+        
+        Args:
+            labels: Cluster labels from fit()
+            
+        Returns:
+            dict: Analysis results
+        """
+        unique_labels = torch.unique(labels)
+        n_clusters = len(unique_labels[unique_labels >= 0])
+        n_noise = (labels == -1).sum().item()
+        n_total = len(labels)
+        
+        cluster_sizes = []
+        for cluster_id in unique_labels[unique_labels >= 0]:
+            size = (labels == cluster_id).sum().item()
+            cluster_sizes.append(size)
+        
+        results = {
+            'n_clusters': n_clusters,
+            'n_noise_points': n_noise,
+            'n_total_points': n_total,
+            'noise_ratio': n_noise / n_total,
+            'cluster_sizes': cluster_sizes,
+            'avg_cluster_size': np.mean(cluster_sizes) if cluster_sizes else 0,
+            'largest_cluster_size': max(cluster_sizes) if cluster_sizes else 0,
+            'smallest_cluster_size': min(cluster_sizes) if cluster_sizes else 0
+        }
+        
+        return results
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Example with synthetic data
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Create some synthetic Gaussian primitives for testing
+    n_points = 1000
+    xyz = torch.randn(n_points, 3, device=device)
+    scaling = torch.abs(torch.randn(n_points, 3, device=device)) * 0.1
+    rotation = torch.randn(n_points, 4, device=device)
+    rotation = rotation / torch.norm(rotation, dim=1, keepdim=True)  # Normalize quaternions
+    opacity = torch.rand(n_points, 1, device=device)
+    features_dc = torch.randn(n_points, 3, 1, device=device)
+    features_rest = torch.randn(n_points, 3, 15, device=device)  # SH degree 3
+    
+    gaussians = GaussianPrimitives(
+        xyz=xyz,
+        scaling=scaling,
+        rotation=rotation,
+        opacity=opacity,
+        features_dc=features_dc,
+        features_rest=features_rest
+    )
+    
+    # Run DBSCAN
+    eps = 1.0
+    min_pts = 10
+    
+    dbscan = BallQueryDBSCAN(eps=eps, min_pts=min_pts)
+    labels = dbscan.fit(gaussians)
+    
+    # Analyze results
+    results = dbscan.analyze_clusters(labels)
+    print("\nClustering Results:")
+    print(f"Number of clusters: {results['n_clusters']}")
+    print(f"Number of noise points: {results['n_noise_points']}")
+    print(f"Noise ratio: {results['noise_ratio']:.2%}")
+    print(f"Average cluster size: {results['avg_cluster_size']:.1f}")
+    print(f"Largest cluster: {results['largest_cluster_size']} points")
+    print(f"Smallest cluster: {results['smallest_cluster_size']} points") 
