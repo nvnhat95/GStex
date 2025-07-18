@@ -1,3 +1,6 @@
 [submodule "submodules/GStex_cuda"]
 	path = submodules/GStex_cuda
 	url = https://github.com/victor-rong/GStex_cuda.git
+[submodule "submodules/ocnn-pytorch"]
+	path = submodules/ocnn-pytorch
+	url = https://github.com/octree-nn/ocnn-pytorch.git
