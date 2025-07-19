@@ -310,12 +310,13 @@ class BallQueryDBSCAN:
         
         return labels
 
-    def analyze_clusters(self, labels):
+    def analyze_clusters(self, labels, ground_truth_labels=None):
         """
-        Analyze clustering results.
+        Analyze clustering results and optionally compare with ground truth.
         
         Args:
             labels: Cluster labels from fit()
+            ground_truth_labels: Optional ground truth cluster labels for comparison
             
         Returns:
             dict: Analysis results
@@ -345,7 +346,82 @@ class BallQueryDBSCAN:
             'smallest_cluster_size': min(cluster_sizes) if cluster_sizes else 0
         }
         
+        # Compare with ground truth if provided
+        if ground_truth_labels is not None:
+            gt_results = self._compare_with_ground_truth(labels, ground_truth_labels)
+            results.update(gt_results)
+        
         return results
+    
+    def _compare_with_ground_truth(self, predicted_labels, ground_truth_labels):
+        """
+        Compare clustering results with ground truth labels.
+        
+        Args:
+            predicted_labels: Cluster labels from DBSCAN
+            ground_truth_labels: Ground truth cluster labels
+            
+        Returns:
+            dict: Comparison metrics
+        """
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, homogeneity_score, completeness_score, v_measure_score
+        
+        # Convert to numpy for sklearn metrics
+        pred_np = predicted_labels.cpu().numpy()
+        gt_np = ground_truth_labels.cpu().numpy()
+        
+        # Calculate clustering metrics
+        ari = adjusted_rand_score(gt_np, pred_np)
+        nmi = normalized_mutual_info_score(gt_np, pred_np)
+        homogeneity = homogeneity_score(gt_np, pred_np)
+        completeness = completeness_score(gt_np, pred_np)
+        v_measure = v_measure_score(gt_np, pred_np)
+        
+        # Analyze cluster correspondence
+        gt_unique = torch.unique(ground_truth_labels)
+        pred_unique = torch.unique(predicted_labels[predicted_labels >= 0])
+        
+        # Count points correctly clustered vs misclassified
+        correct_clustered = 0
+        misclassified = 0
+        
+        for gt_cluster in gt_unique:
+            gt_mask = ground_truth_labels == gt_cluster
+            gt_cluster_points = predicted_labels[gt_mask]
+            
+            # Find the most common predicted cluster for this ground truth cluster
+            if len(gt_cluster_points) > 0:
+                most_common_pred = torch.mode(gt_cluster_points)[0]
+                if most_common_pred >= 0:  # Not noise
+                    correct_in_cluster = (gt_cluster_points == most_common_pred).sum().item()
+                    correct_clustered += correct_in_cluster
+                    misclassified += len(gt_cluster_points) - correct_in_cluster
+                else:
+                    misclassified += len(gt_cluster_points)  # All marked as noise
+        
+        total_points = len(ground_truth_labels)
+        accuracy = correct_clustered / total_points if total_points > 0 else 0
+        
+        comparison_results = {
+            'adjusted_rand_score': ari,
+            'normalized_mutual_info_score': nmi,
+            'homogeneity_score': homogeneity,
+            'completeness_score': completeness,
+            'v_measure_score': v_measure,
+            'clustering_accuracy': accuracy,
+            'correctly_clustered_points': correct_clustered,
+            'misclassified_points': misclassified,
+            'n_ground_truth_clusters': len(gt_unique),
+            'n_predicted_clusters': len(pred_unique)
+        }
+        
+        logger.info(f"Ground truth comparison:")
+        logger.info(f"  Adjusted Rand Score: {ari:.4f}")
+        logger.info(f"  Normalized Mutual Info: {nmi:.4f}")
+        logger.info(f"  Clustering Accuracy: {accuracy:.4f}")
+        logger.info(f"  Correctly clustered: {correct_clustered}/{total_points}")
+        
+        return comparison_results
 
 
 # Example usage and testing
@@ -372,18 +448,23 @@ if __name__ == "__main__":
     ], device=device)
     
     xyz_list = []
+    ground_truth_labels = []
+    
     for i in range(n_clusters):
         # Generate points around each cluster center
         cluster_points = cluster_centers[i] + torch.randn(cluster_size, 3, device=device) * 0.5
         xyz_list.append(cluster_points)
+        ground_truth_labels.extend([i] * cluster_size)
     
     # Add remaining points as noise
     remaining = n_points - n_clusters * cluster_size
     if remaining > 0:
         noise_points = torch.randn(remaining, 3, device=device) * 10.0  # Spread out noise
         xyz_list.append(noise_points)
+        ground_truth_labels.extend([-1] * remaining)  # -1 for noise points
     
     xyz = torch.cat(xyz_list, dim=0)
+    ground_truth_labels = torch.tensor(ground_truth_labels, device=device)
     
     # Generate other properties
     scaling = torch.abs(torch.randn(n_points, 3, device=device)) * 0.1
@@ -416,8 +497,8 @@ if __name__ == "__main__":
     dbscan = BallQueryDBSCAN(eps=eps, min_pts=min_pts, search_radius_multiplier=1.5)
     labels = dbscan.fit(gaussians)
     
-    # Analyze results
-    results = dbscan.analyze_clusters(labels)
+    # Analyze results with ground truth comparison
+    results = dbscan.analyze_clusters(labels, ground_truth_labels)
     print("\nClustering Results:")
     print(f"Number of clusters: {results['n_clusters']}")
     print(f"Number of noise points: {results['n_noise_points']}")
@@ -426,4 +507,17 @@ if __name__ == "__main__":
         print(f"Average cluster size: {results['avg_cluster_size']:.1f}")
         print(f"Largest cluster: {results['largest_cluster_size']} points")
         print(f"Smallest cluster: {results['smallest_cluster_size']} points")
-        print(f"Cluster sizes: {sorted(results['cluster_sizes'], reverse=True)}") 
+        print(f"Cluster sizes: {sorted(results['cluster_sizes'], reverse=True)}")
+    
+    # Print ground truth comparison results
+    if 'adjusted_rand_score' in results:
+        print("\nGround Truth Comparison:")
+        print(f"Adjusted Rand Score: {results['adjusted_rand_score']:.4f}")
+        print(f"Normalized Mutual Info: {results['normalized_mutual_info_score']:.4f}")
+        print(f"Homogeneity Score: {results['homogeneity_score']:.4f}")
+        print(f"Completeness Score: {results['completeness_score']:.4f}")
+        print(f"V-Measure Score: {results['v_measure_score']:.4f}")
+        print(f"Clustering Accuracy: {results['clustering_accuracy']:.4f}")
+        print(f"Correctly clustered: {results['correctly_clustered_points']}/{results['n_total_points']}")
+        print(f"Ground truth clusters: {results['n_ground_truth_clusters']}")
+        print(f"Predicted clusters: {results['n_predicted_clusters']}") 
