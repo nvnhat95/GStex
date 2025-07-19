@@ -150,7 +150,7 @@ class BallQueryDBSCAN:
                 radius=search_radius,
                 K=max_neighbors,
                 return_nn=False
-            )
+            ) # (1, 1, K)
             
             # Extract valid neighbors (ball_query pads with -1)
             candidates = neighbor_indices[0, 0]  # (K,)
@@ -161,7 +161,7 @@ class BallQueryDBSCAN:
             if len(candidate_indices) > points.shape[0] * 0.8:  # More than 80% of points
                 print(f"Warning: Ball query found {len(candidate_indices)}/{points.shape[0]} candidates (search_radius={search_radius:.3f})")
                 # Reduce to smaller radius for this query
-                reduced_radius = self.eps * 0.5  # Use smaller radius
+                reduced_radius = search_radius * 0.5  # Use smaller radius
                 _, neighbor_indices, _ = ball_query(
                     query_point, all_points,
                     radius=reduced_radius,
