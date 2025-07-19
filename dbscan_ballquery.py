@@ -1,9 +1,26 @@
 import torch
 import numpy as np
+import logging
 from tqdm import tqdm
 from pytorch3d.ops import ball_query
 from nerfstudio.utils.rotations import quaternion_to_matrix
 from dataclasses import dataclass
+
+# Set up logger
+logger = logging.getLogger(__name__)
+
+def setup_logger(level=logging.INFO):
+    """Setup logger with appropriate formatting and level."""
+    if not logger.handlers:  # Avoid adding multiple handlers
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    
+    logger.setLevel(level)
+    return logger
 
 
 @dataclass
@@ -114,6 +131,13 @@ class BallQueryDBSCAN:
             min_pts: Minimum number of points required to form a cluster
             search_radius_multiplier: Multiplier for initial ball_query radius 
                                     (since Euclidean != Wasserstein distance)
+        
+        Logging:
+            The class uses the module logger for debugging. To enable debug output:
+            - Call setup_logger(logging.DEBUG) before using the class
+            - Debug logs include neighbor finding details, cluster expansion info, etc.
+            - Info logs show clustering progress and final results
+            - Warning logs indicate potential issues (e.g., too many candidates in ball query)
         """
         self.eps = eps
         self.min_pts = min_pts
@@ -132,6 +156,8 @@ class BallQueryDBSCAN:
         """
         points = gaussians.xyz
         device = points.device
+        
+        logger.debug(f"Finding neighbors for point {point_idx} at position {points[point_idx]}")
         
         # Query point
         query_point = points[point_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
@@ -159,7 +185,7 @@ class BallQueryDBSCAN:
             
             # Debug: Check if we're getting too many candidates
             if len(candidate_indices) > points.shape[0] * 0.8:  # More than 80% of points
-                print(f"Warning: Ball query found {len(candidate_indices)}/{points.shape[0]} candidates (search_radius={search_radius:.3f})")
+                logger.warning(f"Ball query found {len(candidate_indices)}/{points.shape[0]} candidates (search_radius={search_radius:.3f}). Reducing radius.")
                 # Reduce to smaller radius for this query
                 reduced_radius = search_radius * 0.5  # Use smaller radius
                 _, neighbor_indices, _ = ball_query(
@@ -171,11 +197,11 @@ class BallQueryDBSCAN:
                 candidates = neighbor_indices[0, 0]
                 valid_mask = candidates >= 0
                 candidate_indices = candidates[valid_mask]
-                print(f"Reduced search found {len(candidate_indices)} candidates")
+                logger.debug(f"Reduced search found {len(candidate_indices)} candidates")
             
         except Exception as e:
             # Fallback: if ball_query fails, use all points as candidates
-            print(f"Ball query failed: {e}. Using all points as candidates.")
+            logger.warning(f"Ball query failed: {e}. Using all points as candidates.")
             candidate_indices = torch.arange(points.shape[0], device=device)
         
         # Remove self from candidates
@@ -199,9 +225,15 @@ class BallQueryDBSCAN:
             candidate_mu, candidate_scale, candidate_quat
         )  # (M,)
         
+        logger.debug(f"Computed {len(wasserstein_dists)} wasserstein distances, "
+                    f"min: {wasserstein_dists.min():.4f}, max: {wasserstein_dists.max():.4f}, "
+                    f"mean: {wasserstein_dists.mean():.4f}")
+        
         # Filter neighbors based on wasserstein distance threshold
         valid_neighbors_mask = wasserstein_dists <= self.eps
         neighbors = candidate_indices[valid_neighbors_mask]
+        
+        logger.debug(f"Found {len(neighbors)} valid neighbors within eps={self.eps}")
         
         return neighbors
 
@@ -225,8 +257,8 @@ class BallQueryDBSCAN:
         labels = torch.full((n_points,), -2, dtype=torch.long, device=device)
         cluster_id = 0
 
-        print(f"Starting ball query-based DBSCAN clustering on {n_points} Gaussian splats...")
-        print(f"Parameters: eps={self.eps}, min_pts={self.min_pts}")
+        logger.info(f"Starting ball query-based DBSCAN clustering on {n_points} Gaussian splats...")
+        logger.info(f"Parameters: eps={self.eps}, min_pts={self.min_pts}")
 
         # Iterate over all points
         for point_idx in tqdm(range(n_points), desc="DBSCAN clustering"):
@@ -239,11 +271,13 @@ class BallQueryDBSCAN:
             # Check if point is a core point
             if len(neighbor_indices) < self.min_pts:
                 labels[point_idx] = -1  # Mark as noise
+                logger.debug(f"Point {point_idx} marked as noise (only {len(neighbor_indices)} neighbors)")
                 continue
                 
             # Start new cluster
             cluster_id += 1
             labels[point_idx] = cluster_id
+            logger.debug(f"Starting new cluster {cluster_id} at point {point_idx} with {len(neighbor_indices)} initial neighbors")
             
             # Convert to list for dynamic expansion
             neighbor_list = neighbor_indices.tolist()
@@ -263,9 +297,14 @@ class BallQueryDBSCAN:
                     
                     if len(neighbor_neighbors) >= self.min_pts:
                         # Add new neighbors to expansion list (avoid duplicates)
+                        new_neighbors_count = 0
                         for nn in neighbor_neighbors:
                             if nn.item() not in neighbor_list:
                                 neighbor_list.append(nn.item())
+                                new_neighbors_count += 1
+                        
+                        logger.debug(f"Expanded cluster {cluster_id} from core point {neighbor_idx}, "
+                                   f"added {new_neighbors_count} new neighbors (total: {len(neighbor_list)})")
                 
                 i += 1
         
@@ -281,10 +320,14 @@ class BallQueryDBSCAN:
         Returns:
             dict: Analysis results
         """
+        logger.debug("Starting cluster analysis...")
+        
         unique_labels = torch.unique(labels)
         n_clusters = len(unique_labels[unique_labels >= 0])
         n_noise = (labels == -1).sum().item()
         n_total = len(labels)
+        
+        logger.debug(f"Found {n_clusters} clusters and {n_noise} noise points out of {n_total} total points")
         
         cluster_sizes = []
         for cluster_id in unique_labels[unique_labels >= 0]:
@@ -307,6 +350,9 @@ class BallQueryDBSCAN:
 
 # Example usage and testing
 if __name__ == "__main__":
+    # Setup logger - change to logging.DEBUG for detailed debugging info
+    setup_logger(level=logging.DEBUG)  # Use logging.DEBUG for more verbose output
+    
     # Example with synthetic data
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
