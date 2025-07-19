@@ -7,6 +7,7 @@ This script shows how to load PLY files and run the ball query-based DBSCAN clus
 import argparse
 import torch
 import numpy as np
+import time
 from plyfile import PlyData
 from nerfstudio.utils.rotations import matrix_to_quaternion, quaternion_to_matrix
 from dbscan_ballquery import BallQueryDBSCAN, GaussianPrimitives
@@ -94,7 +95,7 @@ def load_ply(path, sh_degree=0, fix_init=False):
 
 def save_cluster_results(gaussians, labels, output_path):
     """
-    Save clustering results to a text file with cluster statistics.
+    Save clustering results to a text file with detailed cluster statistics.
     
     Args:
         gaussians: GaussianPrimitives object
@@ -117,59 +118,207 @@ def save_cluster_results(gaussians, labels, output_path):
         f.write(f"Noise points: {n_noise}\n")
         f.write(f"Noise ratio: {n_noise / n_total:.2%}\n\n")
         
-        f.write("Cluster Details:\n")
-        f.write("-" * 30 + "\n")
+        # Overall statistics
+        cluster_sizes = []
+        cluster_centers = []
+        cluster_bounds = []
+        cluster_opacities = []
+        cluster_scales = []
         
         for cluster_id in unique_labels[unique_labels >= 0]:
             cluster_mask = labels == cluster_id
             cluster_size = cluster_mask.sum().item()
             cluster_points = gaussians.xyz[cluster_mask]
+            cluster_opacity = gaussians.opacity[cluster_mask]
+            cluster_scale = gaussians.scaling[cluster_mask]
             
-            # Compute cluster center and bounding box
+            # Compute cluster statistics
             center = cluster_points.mean(dim=0)
             min_coords = cluster_points.min(dim=0)[0]
             max_coords = cluster_points.max(dim=0)[0]
             bbox_size = max_coords - min_coords
+            avg_opacity = cluster_opacity.mean().item()
+            avg_scale = cluster_scale.mean(dim=0)
+            
+            cluster_sizes.append(cluster_size)
+            cluster_centers.append(center)
+            cluster_bounds.append(bbox_size)
+            cluster_opacities.append(avg_opacity)
+            cluster_scales.append(avg_scale)
             
             f.write(f"Cluster {cluster_id}:\n")
-            f.write(f"  Size: {cluster_size} points\n")
+            f.write(f"  Size: {cluster_size} points ({cluster_size/n_total*100:.1f}%)\n")
             f.write(f"  Center: ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})\n")
-            f.write(f"  Bounding box: {bbox_size[0]:.3f} x {bbox_size[1]:.3f} x {bbox_size[2]:.3f}\n\n")
+            f.write(f"  Bounding box: {bbox_size[0]:.3f} x {bbox_size[1]:.3f} x {bbox_size[2]:.3f}\n")
+            f.write(f"  Avg opacity: {avg_opacity:.3f}\n")
+            f.write(f"  Avg scale: ({avg_scale[0]:.3f}, {avg_scale[1]:.3f}, {avg_scale[2]:.3f})\n\n")
+        
+        # Summary statistics
+        if cluster_sizes:
+            f.write("Summary Statistics:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Average cluster size: {sum(cluster_sizes)/len(cluster_sizes):.1f}\n")
+            f.write(f"Largest cluster: {max(cluster_sizes)} points\n")
+            f.write(f"Smallest cluster: {min(cluster_sizes)} points\n")
+            f.write(f"Cluster size std dev: {np.std(cluster_sizes):.1f}\n")
+            
+            # Spatial distribution
+            centers = torch.stack(cluster_centers)
+            center_distances = torch.cdist(centers, centers)
+            avg_inter_cluster_dist = center_distances[center_distances > 0].mean().item()
+            f.write(f"Average inter-cluster distance: {avg_inter_cluster_dist:.3f}\n")
+            
+            # Opacity and scale statistics
+            avg_opacity = sum(cluster_opacities) / len(cluster_opacities)
+            f.write(f"Average cluster opacity: {avg_opacity:.3f}\n")
+            
+            avg_scales = torch.stack(cluster_scales).mean(dim=0)
+            f.write(f"Average cluster scale: ({avg_scales[0]:.3f}, {avg_scales[1]:.3f}, {avg_scales[2]:.3f})\n\n")
     
     print(f"Results saved to: {output_path}")
 
 
 def visualize_clusters_simple(gaussians, labels, max_clusters_to_show=10):
     """
-    Simple visualization of cluster statistics.
+    Enhanced visualization of cluster statistics with detailed analysis.
     """
     unique_labels = torch.unique(labels)
     cluster_labels = unique_labels[unique_labels >= 0]
     n_noise = (labels == -1).sum().item()
+    n_total = len(labels)
     
-    print(f"\n{'='*60}")
-    print(f"CLUSTER VISUALIZATION")
-    print(f"{'='*60}")
+    print(f"\n{'='*80}")
+    print(f"CLUSTER ANALYSIS & VISUALIZATION")
+    print(f"{'='*80}")
     print(f"Total clusters found: {len(cluster_labels)}")
-    print(f"Noise points: {n_noise}")
-    print(f"{'='*60}")
+    print(f"Noise points: {n_noise} ({n_noise/n_total*100:.1f}%)")
+    print(f"Clustered points: {n_total - n_noise} ({(n_total - n_noise)/n_total*100:.1f}%)")
+    print(f"{'='*80}")
     
-    # Show top clusters by size
-    cluster_sizes = []
+    # Collect cluster statistics
+    cluster_stats = []
     for cluster_id in cluster_labels:
-        size = (labels == cluster_id).sum().item()
-        cluster_sizes.append((cluster_id.item(), size))
+        cluster_mask = labels == cluster_id
+        cluster_size = cluster_mask.sum().item()
+        cluster_points = gaussians.xyz[cluster_mask]
+        cluster_opacity = gaussians.opacity[cluster_mask]
+        cluster_scale = gaussians.scaling[cluster_mask]
+        
+        # Compute statistics
+        center = cluster_points.mean(dim=0)
+        bbox_size = cluster_points.max(dim=0)[0] - cluster_points.min(dim=0)[0]
+        avg_opacity = cluster_opacity.mean().item()
+        avg_scale = cluster_scale.mean(dim=0)
+        scale_magnitude = torch.norm(avg_scale).item()
+        
+        cluster_stats.append({
+            'id': cluster_id.item(),
+            'size': cluster_size,
+            'percentage': cluster_size / n_total * 100,
+            'center': center,
+            'bbox_size': bbox_size,
+            'avg_opacity': avg_opacity,
+            'avg_scale': avg_scale,
+            'scale_magnitude': scale_magnitude
+        })
     
-    cluster_sizes.sort(key=lambda x: x[1], reverse=True)
+    # Sort by size
+    cluster_stats.sort(key=lambda x: x['size'], reverse=True)
     
-    print(f"Top {min(max_clusters_to_show, len(cluster_sizes))} clusters by size:")
-    print(f"{'Cluster ID':<12} {'Size':<8} {'Percentage':<12}")
-    print(f"{'-'*32}")
+    # Display top clusters
+    print(f"Top {min(max_clusters_to_show, len(cluster_stats))} clusters by size:")
+    print(f"{'ID':<6} {'Size':<8} {'%':<6} {'Center (x,y,z)':<25} {'BBox':<20} {'Opacity':<8} {'Scale':<12}")
+    print(f"{'-'*90}")
     
-    total_points = len(labels)
-    for i, (cluster_id, size) in enumerate(cluster_sizes[:max_clusters_to_show]):
-        percentage = size / total_points * 100
-        print(f"{cluster_id:<12} {size:<8} {percentage:<12.1f}%")
+    for i, stats in enumerate(cluster_stats[:max_clusters_to_show]):
+        center_str = f"({stats['center'][0]:.2f},{stats['center'][1]:.2f},{stats['center'][2]:.2f})"
+        bbox_str = f"{stats['bbox_size'][0]:.2f}x{stats['bbox_size'][1]:.2f}x{stats['bbox_size'][2]:.2f}"
+        scale_str = f"{stats['scale_magnitude']:.3f}"
+        
+        print(f"{stats['id']:<6} {stats['size']:<8} {stats['percentage']:<6.1f} {center_str:<25} {bbox_str:<20} {stats['avg_opacity']:<8.3f} {scale_str:<12}")
+    
+    # Summary statistics
+    if cluster_stats:
+        sizes = [s['size'] for s in cluster_stats]
+        opacities = [s['avg_opacity'] for s in cluster_stats]
+        scales = [s['scale_magnitude'] for s in cluster_stats]
+        
+        print(f"\n{'='*80}")
+        print(f"SUMMARY STATISTICS")
+        print(f"{'='*80}")
+        print(f"Cluster size - Mean: {np.mean(sizes):.1f}, Std: {np.std(sizes):.1f}, Min: {min(sizes)}, Max: {max(sizes)}")
+        print(f"Opacity - Mean: {np.mean(opacities):.3f}, Std: {np.std(opacities):.3f}, Min: {min(opacities):.3f}, Max: {max(opacities):.3f}")
+        print(f"Scale magnitude - Mean: {np.mean(scales):.3f}, Std: {np.std(scales):.3f}, Min: {min(scales):.3f}, Max: {max(scales):.3f}")
+        
+        # Spatial distribution analysis
+        centers = torch.stack([s['center'] for s in cluster_stats])
+        center_distances = torch.cdist(centers, centers)
+        inter_cluster_dists = center_distances[center_distances > 0]
+        if len(inter_cluster_dists) > 0:
+            print(f"Inter-cluster distances - Mean: {inter_cluster_dists.mean():.3f}, Std: {inter_cluster_dists.std():.3f}")
+        
+        # Density analysis
+        total_volume = sum(s['bbox_size'][0] * s['bbox_size'][1] * s['bbox_size'][2] for s in cluster_stats)
+        avg_density = sum(sizes) / total_volume if total_volume > 0 else 0
+        print(f"Average cluster density: {avg_density:.3f} points per unit volume")
+    
+    print(f"{'='*80}")
+
+
+def create_cluster_visualization(gaussians, labels, max_clusters_to_show=10):
+    """
+    Create a simple 3D scatter plot visualization of clusters.
+    Requires matplotlib.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        
+        # Get unique cluster labels
+        unique_labels = torch.unique(labels)
+        cluster_labels = unique_labels[unique_labels >= 0]
+        
+        # Limit number of clusters to show
+        if len(cluster_labels) > max_clusters_to_show:
+            # Get top clusters by size
+            cluster_sizes = [(label, (labels == label).sum().item()) for label in cluster_labels]
+            cluster_sizes.sort(key=lambda x: x[1], reverse=True)
+            cluster_labels = torch.tensor([label for label, _ in cluster_sizes[:max_clusters_to_show]])
+        
+        # Create figure
+        fig = plt.figure(figsize=(12, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Plot each cluster with different color
+        colors = plt.cm.tab20(np.linspace(0, 1, len(cluster_labels)))
+        
+        for i, cluster_id in enumerate(cluster_labels):
+            cluster_mask = labels == cluster_id
+            cluster_points = gaussians.xyz[cluster_mask].cpu().numpy()
+            
+            ax.scatter(cluster_points[:, 0], cluster_points[:, 1], cluster_points[:, 2], 
+                      c=[colors[i]], label=f'Cluster {cluster_id}', alpha=0.6, s=1)
+        
+        # Plot noise points in black
+        noise_mask = labels == -1
+        if noise_mask.sum() > 0:
+            noise_points = gaussians.xyz[noise_mask].cpu().numpy()
+            ax.scatter(noise_points[:, 0], noise_points[:, 1], noise_points[:, 2], 
+                      c='black', label='Noise', alpha=0.3, s=0.5)
+        
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.set_title(f'BallQueryDBSCAN Clustering Results ({len(cluster_labels)} clusters shown)')
+        ax.legend()
+        
+        plt.tight_layout()
+        plt.show()
+        
+    except ImportError:
+        print("matplotlib not available, skipping 3D visualization")
+    except Exception as e:
+        print(f"Error creating visualization: {e}")
 
 
 def main():
@@ -183,6 +332,7 @@ def main():
     parser.add_argument("--device", type=str, default="auto", help="Device to use (cuda/cpu/auto)")
     parser.add_argument("--output", type=str, default=None, help="Output file to save results")
     parser.add_argument("--max_points", type=int, default=None, help="Maximum number of points to process (for testing)")
+    parser.add_argument("--visualize", action="store_true", help="Create 3D scatter plot visualization of clusters")
     
     args = parser.parse_args()
     
@@ -199,6 +349,13 @@ def main():
     try:
         gaussians = load_ply(args.path, args.sh_degree, args.fix_init)
         print(f"Loaded {gaussians.xyz.shape[0]} Gaussian primitives")
+        
+        # Print data statistics
+        print(f"Data statistics:")
+        print(f"  Point cloud bounds: {gaussians.xyz.min(dim=0)[0]} to {gaussians.xyz.max(dim=0)[0]}")
+        print(f"  Scale range: {gaussians.scaling.min():.3f} to {gaussians.scaling.max():.3f}")
+        print(f"  Opacity range: {gaussians.opacity.min():.3f} to {gaussians.opacity.max():.3f}")
+        
     except Exception as e:
         print(f"Error loading PLY file: {e}")
         return
@@ -223,9 +380,10 @@ def main():
         gaussians.features_rest = gaussians.features_rest[indices]
     
     print(f"Processing {gaussians.xyz.shape[0]} points")
-    print(f"Ball Query DBSCAN parameters: eps={args.eps}, min_pts={args.min_pts}")
+    print(f"Ball Query DBSCAN parameters: eps={args.eps}, min_pts={args.min_pts}, search_multiplier={args.search_multiplier}")
     
     # Initialize and run DBSCAN
+    print(f"\nInitializing BallQueryDBSCAN...")
     dbscan = BallQueryDBSCAN(
         eps=args.eps, 
         min_pts=args.min_pts,
@@ -233,9 +391,16 @@ def main():
     )
     
     try:
+        print(f"Starting clustering process...")
+        start_time = time.time()
+        
         labels = dbscan.fit(gaussians)
         
+        clustering_time = time.time() - start_time
+        print(f"Clustering completed in {clustering_time:.2f} seconds")
+        
         # Analyze results
+        print(f"Analyzing clustering results...")
         results = dbscan.analyze_clusters(labels)
         
         print(f"\n{'='*60}")
@@ -248,13 +413,33 @@ def main():
             print(f"Average cluster size: {results['avg_cluster_size']:.1f}")
             print(f"Largest cluster: {results['largest_cluster_size']} points")
             print(f"Smallest cluster: {results['smallest_cluster_size']} points")
+            print(f"Cluster size distribution: {sorted(results['cluster_sizes'], reverse=True)[:10]}...")
+        print(f"Processing speed: {gaussians.xyz.shape[0] / clustering_time:.0f} points/second")
         
-        # Simple visualization
+        # Enhanced visualization
         visualize_clusters_simple(gaussians, labels)
         
         # Save results if requested
         if args.output:
             save_cluster_results(gaussians, labels, args.output)
+        
+        # Create visualization if requested
+        if args.visualize:
+            print(f"\nCreating 3D visualization...")
+            create_cluster_visualization(gaussians, labels)
+        
+        # Final summary
+        print(f"\n{'='*60}")
+        print(f"FINAL SUMMARY")
+        print(f"{'='*60}")
+        print(f"✓ Successfully clustered {gaussians.xyz.shape[0]} Gaussian primitives")
+        print(f"✓ Found {results['n_clusters']} clusters with {results['n_noise_points']} noise points")
+        print(f"✓ Processing speed: {gaussians.xyz.shape[0] / clustering_time:.0f} points/second")
+        if args.output:
+            print(f"✓ Results saved to: {args.output}")
+        if args.visualize:
+            print(f"✓ 3D visualization created")
+        print(f"{'='*60}")
         
     except Exception as e:
         print(f"Error during clustering: {e}")
