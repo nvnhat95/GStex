@@ -287,24 +287,29 @@ class BallQueryDBSCAN:
             while i < len(neighbor_list):
                 neighbor_idx = neighbor_list[i]
                 
-                if labels[neighbor_idx] == -1:  # Convert noise to border point
-                    labels[neighbor_idx] = cluster_id
-                elif labels[neighbor_idx] == -2:  # Unclassified point
+                # A point should be processed if it is unclassified (-2) or was marked as noise (-1)
+                if labels[neighbor_idx] == -2 or labels[neighbor_idx] == -1:
+                    # Assign to current cluster
                     labels[neighbor_idx] = cluster_id
                     
-                    # Check if this neighbor is also a core point
+                    # Check if this neighbor is a core point to expand the cluster
                     neighbor_neighbors = self.find_neighbors(gaussians, neighbor_idx)
                     
+                    # If the neighbor has enough neighbors, it is a core point.
                     if len(neighbor_neighbors) >= self.min_pts:
-                        # Add new neighbors to expansion list (avoid duplicates)
+                        # Add new neighbors to expansion list. This point is a core point.
                         new_neighbors_count = 0
                         for nn in neighbor_neighbors:
-                            if nn.item() not in neighbor_list:
-                                neighbor_list.append(nn.item())
+                            nn_item = nn.item()
+                            # Add neighbors that are unclassified or noise to the queue.
+                            # Checking `not in neighbor_list` avoids duplicates in the queue.
+                            if (labels[nn_item] == -2 or labels[nn_item] == -1) and (nn_item not in neighbor_list):
+                                neighbor_list.append(nn_item)
                                 new_neighbors_count += 1
                         
-                        logger.debug(f"Expanded cluster {cluster_id} from core point {neighbor_idx}, "
-                                   f"added {new_neighbors_count} new neighbors (total: {len(neighbor_list)})")
+                        if new_neighbors_count > 0:
+                            logger.debug(f"Expanded cluster {cluster_id} from core point {neighbor_idx}, "
+                                       f"added {new_neighbors_count} new neighbors (total: {len(neighbor_list)})")
                 
                 i += 1
         
