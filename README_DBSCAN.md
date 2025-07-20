@@ -10,6 +10,7 @@ The ball query-based DBSCAN implementation removes the complexity of octree-base
 
 - **Ball query neighbor search**: Uses PyTorch3D's `ball_query` instead of octree structures
 - **Wasserstein distance metric**: Proper distance metric for Gaussian primitives considering both position and covariance
+- **Automatic parameter estimation**: K-distance graph analysis for optimal eps estimation
 - **GPU acceleration**: Full CUDA support for large point clouds
 - **Easy-to-use interface**: Simple API for loading PLY files and running clustering
 - **Comprehensive analysis**: Built-in cluster analysis and visualization tools
@@ -30,6 +31,8 @@ pip install pytorch3d
 pip install plyfile
 pip install tqdm
 pip install numpy
+pip install matplotlib  # For k-distance plots and visualization
+pip install scipy      # For k-distance analysis
 ```
 
 You'll also need the nerfstudio package for rotation utilities:
@@ -44,10 +47,13 @@ pip install nerfstudio
 ```python
 from dbscan_ballquery import BallQueryDBSCAN, GaussianPrimitives
 
-# Initialize DBSCAN
-eps = 1.5  # Wasserstein distance threshold
+# Initialize DBSCAN with automatic eps estimation
 min_pts = 20  # Minimum points per cluster
-dbscan = BallQueryDBSCAN(eps=eps, min_pts=min_pts)
+dbscan = BallQueryDBSCAN(eps=1.0, min_pts=min_pts)  # Initial eps will be updated
+
+# Estimate good eps value using k-distance graph
+suggested_eps = dbscan.plot_k_distance_graph(gaussians, k=min_pts)
+dbscan.eps = suggested_eps
 
 # Run clustering (gaussians is a GaussianPrimitives object)
 labels = dbscan.fit(gaussians)
@@ -66,8 +72,10 @@ from dbscan_ballquery import BallQueryDBSCAN
 # Load PLY file
 gaussians = load_ply("path/to/your/file.ply", sh_degree=3)
 
-# Run DBSCAN
-dbscan = BallQueryDBSCAN(eps=1.5, min_pts=20)
+# Run DBSCAN with automatic eps estimation
+dbscan = BallQueryDBSCAN(eps=1.0, min_pts=20)
+suggested_eps = dbscan.plot_k_distance_graph(gaussians)
+dbscan.eps = suggested_eps
 labels = dbscan.fit(gaussians)
 ```
 
@@ -76,6 +84,10 @@ labels = dbscan.fit(gaussians)
 Use the demo script to run DBSCAN on PLY files:
 
 ```bash
+# Automatic eps estimation (recommended)
+python demo_ballquery_dbscan.py --path /path/to/your/file.ply --min_pts 20
+
+# Manual eps specification
 python demo_ballquery_dbscan.py --path /path/to/your/file.ply --eps 1.5 --min_pts 20
 ```
 
@@ -84,27 +96,32 @@ python demo_ballquery_dbscan.py --path /path/to/your/file.ply --eps 1.5 --min_pt
 - `--path`: Path to PLY file (required)
 - `--sh_degree`: Spherical harmonics degree (default: 3)
 - `--fix_init`: Fix initialization for COLMAP/DTU datasets
-- `--eps`: DBSCAN eps parameter - Wasserstein distance threshold (default: 1.5)
+- `--eps`: DBSCAN eps parameter - Wasserstein distance threshold (default: None, will be estimated)
 - `--min_pts`: DBSCAN min_pts parameter (default: 20)
 - `--search_multiplier`: Search radius multiplier for ball_query (default: 2.0)
 - `--device`: Device to use - cuda/cpu/auto (default: auto)
 - `--output`: Output file to save results
 - `--max_points`: Maximum number of points to process (for testing)
+- `--n_samples`: Number of points to sample for eps estimation (default: 1000)
+- `--skip_eps_estimation`: Skip eps estimation even if eps is not provided
 
 ### Example Commands
 
 ```bash
-# Basic clustering
-python demo_ballquery_dbscan.py --path scene.ply --eps 1.0 --min_pts 15
+# Automatic eps estimation
+python demo_ballquery_dbscan.py --path scene.ply --min_pts 15
 
-# With output file
+# Manual eps specification
 python demo_ballquery_dbscan.py --path scene.ply --eps 1.5 --min_pts 20 --output results.txt
 
+# Automatic eps estimation with more samples
+python demo_ballquery_dbscan.py --path scene.ply --min_pts 20 --n_samples 2000
+
 # Test with subset of points
-python demo_ballquery_dbscan.py --path large_scene.ply --max_points 5000 --eps 1.0
+python demo_ballquery_dbscan.py --path large_scene.ply --max_points 5000
 
 # For COLMAP/DTU datasets
-python demo_ballquery_dbscan.py --path colmap_scene.ply --fix_init --eps 2.0
+python demo_ballquery_dbscan.py --path colmap_scene.ply --fix_init
 ```
 
 ## Algorithm Details
@@ -113,11 +130,27 @@ python demo_ballquery_dbscan.py --path colmap_scene.ply --fix_init --eps 2.0
 
 The implementation follows the standard DBSCAN algorithm:
 
-1. **Initialization**: All points start as unclassified (-2)
-2. **Core Point Detection**: For each unclassified point, find neighbors within `eps` distance
-3. **Cluster Formation**: If a point has ≥ `min_pts` neighbors, start a new cluster
-4. **Cluster Expansion**: Recursively add neighbors and their neighbors to the cluster
-5. **Noise Classification**: Points that don't belong to any cluster are marked as noise (-1)
+1. **Parameter Estimation**: (Optional) Use k-distance graph to find optimal eps
+2. **Initialization**: All points start as unclassified (-2)
+3. **Core Point Detection**: For each unclassified point, find neighbors within `eps` distance
+4. **Cluster Formation**: If a point has ≥ `min_pts` neighbors, start a new cluster
+5. **Cluster Expansion**: Recursively add neighbors and their neighbors to the cluster
+6. **Noise Classification**: Points that don't belong to any cluster are marked as noise (-1)
+
+### K-Distance Graph Analysis
+
+The k-distance graph helps find an optimal eps value:
+
+1. For each point, find its k-th nearest neighbor (k = min_pts)
+2. Plot these k-distances in sorted order
+3. Find the "elbow" point in the curve
+4. Use this distance as eps
+
+Benefits:
+- Data-driven parameter selection
+- Reduces trial and error
+- Adapts to different scales and densities
+- Helps avoid too many noise points
 
 ### Wasserstein Distance
 
@@ -144,6 +177,7 @@ The `search_multiplier` parameter accounts for the fact that Euclidean distance 
 ### Core Parameters
 
 - **`eps`**: Maximum Wasserstein distance for points to be considered neighbors
+  - Can be automatically estimated using k-distance graph (recommended)
   - Smaller values → more, tighter clusters
   - Larger values → fewer, looser clusters
   - Typical range: 0.5 - 5.0 depending on scene scale
@@ -152,6 +186,7 @@ The `search_multiplier` parameter accounts for the fact that Euclidean distance 
   - Smaller values → more clusters (including small ones)
   - Larger values → fewer, denser clusters
   - Typical range: 5 - 50 depending on point cloud density
+  - Also used as k in k-distance analysis
 
 ### Advanced Parameters
 
@@ -159,6 +194,11 @@ The `search_multiplier` parameter accounts for the fact that Euclidean distance 
   - Higher values → more thorough search but slower
   - Lower values → faster but may miss neighbors
   - Default: 2.0 (good for most cases)
+
+- **`n_samples`**: Number of points to use for eps estimation
+  - Higher values → more accurate estimation but slower
+  - Lower values → faster but might miss structure
+  - Default: 1000 (good balance)
 
 ## Performance Considerations
 
@@ -171,6 +211,7 @@ The `search_multiplier` parameter accounts for the fact that Euclidean distance 
 - GPU acceleration provides significant speedup
 - PyTorch3D's `ball_query` is much faster than naive neighbor search
 - Progress bars show clustering progress
+- Eps estimation uses sampling to reduce computation time
 
 ### Scalability
 - Time complexity: O(n²) in worst case, but typically much better due to spatial locality
@@ -207,23 +248,31 @@ results = {
    - Solution: Use `--device cpu` to run on CPU
 
 3. **No clusters found**: Parameters too strict
+   - Solution: Use automatic eps estimation
    - Solution: Increase `eps` or decrease `min_pts`
    - Solution: Check point cloud scale and adjust `eps` accordingly
 
 4. **Too many small clusters**: Parameters too loose
+   - Solution: Use automatic eps estimation with higher min_pts
    - Solution: Decrease `eps` or increase `min_pts`
+
+5. **Too many noise points (>90%)**:
+   - Solution: Use automatic eps estimation (recommended)
+   - Solution: Increase `eps` value
+   - Solution: Check k-distance plot for better parameter selection
 
 ### Parameter Tuning
 
-1. **Start with defaults**: `eps=1.5`, `min_pts=20`
-2. **Visualize point cloud**: Understand the scale and density
-3. **Test with subset**: Use `--max_points 1000` for quick iteration
-4. **Adjust `eps`**: Most important parameter, should match scene scale
-5. **Adjust `min_pts`**: Fine-tune cluster density requirements
+1. **Use automatic eps estimation**: Let the algorithm find a good eps value
+2. **Start with defaults**: `min_pts=20`, `n_samples=1000`
+3. **Visualize k-distance plot**: Understand the distance distribution
+4. **Adjust min_pts**: Fine-tune cluster density requirements
+5. **If needed, manual eps**: Use k-distance plot as a guide
 
 ## Comparison with Original Implementation
 
 ### Ball Query Version (This Implementation)
+- ✅ Automatic parameter estimation
 - ✅ Cleaner codebase (no octree complexity)
 - ✅ Uses battle-tested PyTorch3D operations
 - ✅ More readable and maintainable
@@ -235,6 +284,7 @@ results = {
 ### Original Version (dbscan.py)
 - ✅ Potentially faster for large, sparse datasets
 - ✅ More memory-efficient octree structure
+- ❌ Manual parameter tuning required
 - ❌ Complex octree implementation
 - ❌ Harder to debug and modify
 - ❌ More prone to bugs in spatial data structures
@@ -246,8 +296,4 @@ To contribute improvements or report issues:
 1. Test with various PLY files and parameter combinations
 2. Profile performance on large datasets
 3. Report any edge cases or failure modes
-4. Suggest parameter tuning guidelines for specific use cases
-
-## License
-
-This implementation builds upon the original `dbscan.py` and inherits its license terms. 
+4. Suggest parameter tuning guidelines for specific use cases 

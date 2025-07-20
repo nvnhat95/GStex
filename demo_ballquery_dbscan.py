@@ -326,13 +326,15 @@ def main():
     parser.add_argument("--path", type=str, required=True, help="Path to PLY file")
     parser.add_argument("--sh_degree", type=int, default=3, help="Spherical harmonics degree")
     parser.add_argument("--fix_init", action="store_true", help="Fix initialization for COLMAP/DTU")
-    parser.add_argument("--eps", type=float, default=1.5, help="DBSCAN eps parameter (wasserstein distance threshold)")
+    parser.add_argument("--eps", type=float, default=None, help="DBSCAN eps parameter (wasserstein distance threshold). If not provided, will be estimated.")
     parser.add_argument("--min_pts", type=int, default=20, help="DBSCAN min_pts parameter")
     parser.add_argument("--search_multiplier", type=float, default=2.0, help="Search radius multiplier for ball_query")
     parser.add_argument("--device", type=str, default="auto", help="Device to use (cuda/cpu/auto)")
     parser.add_argument("--output", type=str, default=None, help="Output file to save results")
     parser.add_argument("--max_points", type=int, default=None, help="Maximum number of points to process (for testing)")
     parser.add_argument("--visualize", action="store_true", help="Create 3D scatter plot visualization of clusters")
+    parser.add_argument("--n_samples", type=int, default=1000, help="Number of points to sample for eps estimation")
+    parser.add_argument("--skip_eps_estimation", action="store_true", help="Skip eps estimation even if eps is not provided")
     
     args = parser.parse_args()
     
@@ -380,15 +382,31 @@ def main():
         gaussians.features_rest = gaussians.features_rest[indices]
     
     print(f"Processing {gaussians.xyz.shape[0]} points")
-    print(f"Ball Query DBSCAN parameters: eps={args.eps}, min_pts={args.min_pts}, search_multiplier={args.search_multiplier}")
     
-    # Initialize and run DBSCAN
-    print(f"\nInitializing BallQueryDBSCAN...")
+    # Initialize DBSCAN with a temporary eps if we need to estimate it
+    eps = args.eps if args.eps is not None else 1.0
     dbscan = BallQueryDBSCAN(
-        eps=args.eps, 
+        eps=eps,
         min_pts=args.min_pts,
         search_radius_multiplier=args.search_multiplier
     )
+    
+    # Estimate eps if not provided
+    if args.eps is None and not args.skip_eps_estimation:
+        print(f"\nEstimating eps parameter using k-distance graph...")
+        print(f"Sampling {args.n_samples} points for estimation...")
+        suggested_eps = dbscan.plot_k_distance_graph(
+            gaussians,
+            k=args.min_pts,
+            n_samples=args.n_samples
+        )
+        print(f"Suggested eps from k-distance graph: {suggested_eps:.4f}")
+        
+        # Update eps
+        dbscan.eps = suggested_eps
+        eps = suggested_eps
+    
+    print(f"\nBall Query DBSCAN parameters: eps={eps}, min_pts={args.min_pts}, search_multiplier={args.search_multiplier}")
     
     try:
         print(f"Starting clustering process...")
