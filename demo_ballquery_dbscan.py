@@ -252,10 +252,18 @@ def visualize_clusters_simple(gaussians, labels, max_clusters_to_show=10):
         
         # Spatial distribution analysis
         centers = torch.stack([s['center'] for s in cluster_stats])
-        center_distances = torch.cdist(centers, centers)
-        inter_cluster_dists = center_distances[center_distances > 0]
-        if len(inter_cluster_dists) > 0:
-            print(f"Inter-cluster distances - Mean: {inter_cluster_dists.mean():.3f}, Std: {inter_cluster_dists.std():.3f}")
+        try:
+            # Try using batched computation if number of centers is large
+            if len(centers) > 1000:
+                inter_cluster_dists = compute_center_distances_batched(centers)
+            else:
+                center_distances = torch.cdist(centers, centers)
+                inter_cluster_dists = center_distances[center_distances > 0]
+                
+            if len(inter_cluster_dists) > 0:
+                print(f"Inter-cluster distances - Mean: {inter_cluster_dists.mean():.3f}, Std: {inter_cluster_dists.std():.3f}")
+        except RuntimeError as e:
+            print(f"Warning: Could not compute inter-cluster distances due to memory constraints")
         
         # Density analysis
         total_volume = sum(s['bbox_size'][0] * s['bbox_size'][1] * s['bbox_size'][2] for s in cluster_stats)
@@ -319,6 +327,36 @@ def create_cluster_visualization(gaussians, labels, max_clusters_to_show=10):
         print("matplotlib not available, skipping 3D visualization")
     except Exception as e:
         print(f"Error creating visualization: {e}")
+
+
+def compute_center_distances_batched(centers, batch_size=1000):
+    """
+    Compute pairwise distances between centers in a memory-efficient way using batching.
+    
+    Args:
+        centers (torch.Tensor): Tensor of cluster centers
+        batch_size (int): Size of batches to process at once
+    
+    Returns:
+        torch.Tensor: Tensor containing non-zero pairwise distances
+    """
+    n_centers = centers.shape[0]
+    device = centers.device
+    all_distances = []
+    
+    for i in range(0, n_centers, batch_size):
+        end_idx = min(i + batch_size, n_centers)
+        batch_centers = centers[i:end_idx]
+        
+        # Compute distances between current batch and all centers
+        batch_distances = torch.cdist(batch_centers, centers)
+        
+        # Extract non-zero distances from this batch
+        batch_nonzero = batch_distances[batch_distances > 0]
+        all_distances.append(batch_nonzero)
+    
+    # Combine all non-zero distances
+    return torch.cat(all_distances) if all_distances else torch.tensor([], device=device)
 
 
 def main():
