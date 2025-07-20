@@ -143,6 +143,124 @@ class BallQueryDBSCAN:
         self.min_pts = min_pts
         self.search_radius_multiplier = search_radius_multiplier
 
+    def plot_k_distance_graph(self, gaussians, k=None, max_radius=10.0, n_samples=None):
+        """
+        Plot k-distance graph to help estimate a good eps value.
+        
+        Args:
+            gaussians: GaussianPrimitives object
+            k: Number of neighbors to consider (defaults to min_pts)
+            max_radius: Maximum radius for ball query
+            n_samples: Number of random points to sample (None means use all points)
+            
+        Returns:
+            Suggested eps value based on elbow detection
+        """
+        import matplotlib.pyplot as plt
+        from pytorch3d.ops import knn_points
+        import numpy as np
+        from scipy.signal import savgol_filter
+        
+        if k is None:
+            k = self.min_pts
+            
+        points = gaussians.xyz
+        n_total = points.shape[0]
+        
+        # Optionally sample a subset of points
+        if n_samples is not None and n_samples < n_total:
+            indices = torch.randperm(n_total)[:n_samples]
+            points_subset = points[indices]
+            scaling_subset = gaussians.scaling[indices]
+            rotation_subset = gaussians.rotation[indices]
+            points_all = points
+            scaling_all = gaussians.scaling
+            rotation_all = gaussians.rotation
+        else:
+            points_subset = points
+            scaling_subset = gaussians.scaling
+            rotation_subset = gaussians.rotation
+            points_all = points
+            scaling_all = gaussians.scaling
+            rotation_all = gaussians.rotation
+            
+        n_points = points_subset.shape[0]
+        logger.info(f"Computing k-distance graph using {n_points} points (k={k})")
+        
+        # First use kNN to get approximate neighbors (Euclidean distance)
+        k_larger = min(k * 4, n_total)  # Get more neighbors than needed since Wasserstein != Euclidean
+        knn_dists, knn_idx, _ = knn_points(
+            points_subset.unsqueeze(0),   # (1, N, 3)
+            points_all.unsqueeze(0),      # (1, M, 3)
+            K=k_larger,
+            return_sorted=True
+        )
+        
+        # Compute Wasserstein distances to these candidates
+        k_distances = []
+        for i in range(n_points):
+            query_mu = points_subset[i:i+1]      # (1, 3)
+            query_scale = scaling_subset[i:i+1]  # (1, 3)
+            query_quat = rotation_subset[i:i+1]  # (1, 4)
+            
+            # Get candidates from kNN
+            candidates = knn_idx[0, i]  # (K,)
+            cand_mu = points_all[candidates]       # (K, 3)
+            cand_scale = scaling_all[candidates]   # (K, 3)
+            cand_quat = rotation_all[candidates]   # (K, 4)
+            
+            # Compute Wasserstein distances
+            w_dists = wasserstein_3d_gaussians(
+                query_mu, query_scale, query_quat,
+                cand_mu, cand_scale, cand_quat
+            )  # (K,)
+            
+            # Sort and get the k-th distance
+            k_dist = torch.sort(w_dists)[0][k-1].item()
+            k_distances.append(k_dist)
+            
+        # Sort distances for the plot
+        k_distances = np.array(sorted(k_distances))
+        points = np.arange(len(k_distances))
+        
+        # Smooth the curve for better elbow detection
+        window = min(21, len(k_distances) // 5)
+        if window % 2 == 0:
+            window += 1
+        y_smooth = savgol_filter(k_distances, window, 3)
+        
+        # Compute approximate derivative
+        dy = np.gradient(y_smooth)
+        d2y = np.gradient(dy)
+        
+        # Find elbow point using maximum curvature
+        curvature = np.abs(d2y) / (1 + dy**2)**(3/2)
+        elbow_idx = np.argmax(curvature[10:-10]) + 10  # Avoid edges
+        suggested_eps = k_distances[elbow_idx]
+        
+        # Plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(points, k_distances, 'b-', alpha=0.5, label='Raw distances')
+        plt.plot(points, y_smooth, 'r-', label='Smoothed')
+        plt.axvline(x=elbow_idx, color='g', linestyle='--', label='Suggested elbow')
+        plt.axhline(y=suggested_eps, color='g', linestyle='--')
+        
+        plt.xlabel('Points (sorted by distance)')
+        plt.ylabel(f'{k}-th nearest neighbor Wasserstein distance')
+        plt.title(f'K-Distance Graph (k={k})')
+        plt.legend()
+        plt.grid(True)
+        
+        # Add text annotation for suggested eps
+        plt.text(0.02, 0.98, f'Suggested eps: {suggested_eps:.4f}', 
+                transform=plt.gca().transAxes, 
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.show()
+        
+        return suggested_eps
+
     def find_neighbors(self, gaussians, point_idx):
         """
         Find neighbors of a single point using PyTorch3D's ball_query and wasserstein distance.
@@ -493,13 +611,18 @@ if __name__ == "__main__":
     print(f"Point cloud bounds: {xyz.min(dim=0)[0]} to {xyz.max(dim=0)[0]}")
     print(f"Mean pairwise distance: {torch.cdist(xyz[:100], xyz[:100]).mean():.3f}")
     
-    # Run DBSCAN with appropriate parameters for this scale
-    eps = 2.0  # Increased eps for the larger scale
+    # First create a DBSCAN instance with dummy eps (will be updated)
     min_pts = 10
+    dbscan = BallQueryDBSCAN(eps=1.0, min_pts=min_pts, search_radius_multiplier=1.5)
     
-    print(f"Running DBSCAN with eps={eps}, min_pts={min_pts}")
+    # Plot k-distance graph and get suggested eps
+    suggested_eps = dbscan.plot_k_distance_graph(gaussians, k=min_pts, n_samples=500)
+    print(f"\nSuggested eps from k-distance graph: {suggested_eps:.4f}")
     
-    dbscan = BallQueryDBSCAN(eps=eps, min_pts=min_pts, search_radius_multiplier=1.5)
+    # Update eps and run DBSCAN
+    dbscan.eps = suggested_eps
+    print(f"\nRunning DBSCAN with eps={dbscan.eps}, min_pts={min_pts}")
+    
     labels = dbscan.fit(gaussians)
     
     # Analyze results with ground truth comparison
