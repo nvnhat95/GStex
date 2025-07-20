@@ -98,14 +98,26 @@ def wasserstein_3d_gaussians(mu1, scale1, quat1, mu2, scale2, quat2):
     
     Args:
       mu1, mu2     : (..., 3)
-      scale1, scale2 : (..., 3) positive std-devs
+      scale1, scale2 : (..., 3) log-scales for first 2 dims, last dim is tied to mean of first 2
       quat1, quat2 : (..., 4) unit quaternions
     Returns:
       W2^2: tensor of shape (...)
     """
+    # Convert log-scales to positive std-devs following GS convention
+    scale1_exp = torch.zeros_like(scale1)
+    scale2_exp = torch.zeros_like(scale2)
+    
+    # First two dims are exp(log_scale) with min clamp
+    scale1_exp[..., :-1] = torch.clamp(torch.exp(scale1[..., :-1]), min=1e-9)
+    scale2_exp[..., :-1] = torch.clamp(torch.exp(scale2[..., :-1]), min=1e-9)
+    
+    # Last dim is tied to mean of first two dims
+    scale1_exp[..., -1] = 1e-5 * torch.mean(scale1_exp[..., :-1], dim=-1)
+    scale2_exp[..., -1] = 1e-5 * torch.mean(scale2_exp[..., :-1], dim=-1)
+    
     # Build covariance matrices
-    cov1 = make_covariance_3d(scale1, quat1)   # (..., 3, 3)
-    cov2 = make_covariance_3d(scale2, quat2)   # (..., 3, 3)
+    cov1 = make_covariance_3d(scale1_exp, quat1)   # (..., 3, 3)
+    cov2 = make_covariance_3d(scale2_exp, quat2)   # (..., 3, 3)
 
     # Squared distance between means
     mean_term = torch.sum((mu1 - mu2)**2, dim=-1)  # (...)
