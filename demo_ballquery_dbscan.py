@@ -366,7 +366,7 @@ def main():
     parser.add_argument("--fix_init", action="store_true", help="Fix initialization for COLMAP/DTU")
     parser.add_argument("--eps", type=float, default=None, help="DBSCAN eps parameter (wasserstein distance threshold). If not provided, will be estimated.")
     parser.add_argument("--min_pts", type=int, default=20, help="DBSCAN min_pts parameter")
-    parser.add_argument("--search_multiplier", type=float, default=2.0, help="Search radius multiplier for ball_query")
+    parser.add_argument("--search_multiplier", type=float, default=1.0, help="Search radius multiplier for ball_query")
     parser.add_argument("--device", type=str, default="auto", help="Device to use (cuda/cpu/auto)")
     parser.add_argument("--output", type=str, default=None, help="Output file to save results")
     parser.add_argument("--max_points", type=int, default=None, help="Maximum number of points to process (for testing)")
