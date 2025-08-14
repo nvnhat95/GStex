@@ -4,3 +4,6 @@
 [submodule "submodules/ocnn-pytorch"]
 	path = submodules/ocnn-pytorch
 	url = https://github.com/octree-nn/ocnn-pytorch.git
+[submodule "submodules/octformer"]
+	path = submodules/octformer
+	url = https://github.com/octree-nn/octformer
